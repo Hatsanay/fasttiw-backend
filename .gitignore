@@ -1,0 +1,11 @@
+node_modules
+.env
+uploads/*
+!uploads/.gitkeep
+!uploads/avatars/
+!uploads/products/
+uploads/avatars/*
+!uploads/avatars/.gitkeep
+uploads/products/*
+!uploads/products/.gitkeep
+npm-debug.log
