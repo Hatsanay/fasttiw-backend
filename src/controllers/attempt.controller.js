@@ -468,7 +468,43 @@ async function getAttemptHistory(req, res, next) {
     }
 }
 
+// พิมพ์แบบฝึกหัด PDF (หน้าคลังข้อสอบของฉัน) — ลูกค้าเลือกได้เองว่าจะสลับลำดับข้อ/ตัวเลือกไหม (?shuffle=0
+// ปิด, default เปิด) และจะเอาเฉลยเต็ม (คำตอบถูก+วิธีคิด+เหตุผลตัวเลือกผิด) ติดไปด้วยไหม (?answers=1 เปิด,
+// default ปิด) — reveal=withAnswers ใช้ buildQuestionPayload ตัวเดียวกับหน้า review ออนไลน์เป๊ะ ไม่ต้อง
+// เขียน logic เฉลยซ้ำ ไม่สร้างแถว tb_attempts เพราะแค่ต้องการชุดคำถามไปพิมพ์ ไม่ใช่เริ่มทำข้อสอบจริง (กัน
+// ชนกับ unique-in-progress-attempt constraint ของ startOrResumeAttempt โดยไม่ตั้งใจ)
+async function exportPrintableQuestions(req, res, next) {
+    try {
+        const productId = req.params.id;
+        const shouldShuffle = req.query.shuffle !== "0";
+        const withAnswers = req.query.answers === "1";
+
+        const hasAccess = await hasActiveEntitlement(req.customer.cus_id, productId);
+        if (!hasAccess) {
+            return res.status(403).json({ message: "สิทธิ์เข้าถึงชุดข้อสอบนี้หมดอายุหรือถูกยกเลิกไปแล้ว" });
+        }
+
+        const [productRows] = await pool.query("SELECT prod_name FROM tb_products WHERE prod_id = ?", [productId]);
+        if (productRows.length === 0) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
+
+        const questionMap = await fetchQuestionsWithChoices(productId);
+        // ไม่สลับ: เรียงตาม ques_id/cho_id ให้ได้ลำดับคงที่แน่นอน (SQL ไม่ได้ ORDER BY มาให้)
+        const orderedQuestionIds = shouldShuffle ? shuffle(Object.keys(questionMap)) : Object.keys(questionMap).sort();
+
+        const questions = orderedQuestionIds.map((quesId) => {
+            const question = questionMap[quesId];
+            const choiceIds = question.choices.map((c) => c.cho_id);
+            const choiceOrder = shouldShuffle ? shuffle(choiceIds) : choiceIds.sort();
+            return buildQuestionPayload(question, choiceOrder, null, withAnswers);
+        });
+
+        res.json({ prod_name: productRows[0].prod_name, questions });
+    } catch (err) {
+        next(err);
+    }
+}
+
 module.exports = {
     startOrResumeAttempt, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory, getWeakAreas,
-    fetchQuestionsWithChoices, fetchSampleQuestions, buildQuestionPayload,
+    fetchQuestionsWithChoices, fetchSampleQuestions, buildQuestionPayload, exportPrintableQuestions,
 };

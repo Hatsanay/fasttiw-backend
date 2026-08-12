@@ -59,6 +59,7 @@ router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.get
 
 // ทำข้อสอบ
 router.post("/V1/store/products/:id/attempts", requireCustomerAuth, attemptController.startOrResumeAttempt);
+router.get("/V1/store/products/:id/export-questions", requireCustomerAuth, attemptController.exportPrintableQuestions);
 router.get("/V1/store/attempts", requireCustomerAuth, attemptController.getAttemptHistory);
 router.get("/V1/store/me/weak-areas", requireCustomerAuth, attemptController.getWeakAreas);
 router.get("/V1/store/attempts/:id", requireCustomerAuth, attemptController.getAttempt);
