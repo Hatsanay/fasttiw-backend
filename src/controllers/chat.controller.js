@@ -7,6 +7,14 @@ const { resolveUploadPath } = require("../utils/uploads");
 
 const CHAT_ATTACHMENT_DIR = path.join(__dirname, "..", "..", "uploads", "chat-attachments");
 
+// mysql2 ปกติจะ auto-parse คอลัมน์ JSON ให้เป็น array/object อยู่แล้ว แต่บาง DB server (เช่น MariaDB ที่
+// JSON เป็นแค่ alias ของ LONGTEXT ไม่ใช่ native JSON type) คืนมาเป็น string ดิบ — ไม่กันไว้ตรงนี้จะทำให้
+// frontend เจอ msg_image_urls เป็น string แทน array แล้ว .map() พังตอน render (เจอจริงบน production)
+function parseJsonColumn(value) {
+    if (value == null) return null;
+    return typeof value === "string" ? JSON.parse(value) : value;
+}
+
 // ─── ระบุตัวตนผู้ถามฝั่งลูกค้า — login แล้ว (req.customer จาก optionalCustomerAuth) ให้ยึด cus_id เป็นหลัก
 // เสมอ ไม่สนใจ X-Guest-Id ที่อาจแนบมาด้วยก็ตาม (เผื่อ merge ไปแล้วแต่ browser ยังเก็บ guest id เก่าค้างอยู่)
 // ยังไม่ login ต้องมี X-Guest-Id ถึงจะทำอะไรต่อได้ (ไม่งั้นไม่รู้ว่าเป็นการสนทนาของใคร)
@@ -132,7 +140,7 @@ async function fetchMessages(convId, afterMsgId) {
                FROM tb_chat_messages WHERE msg_conv_id = ? ORDER BY msg_id ASC`,
               [convId]
           );
-    return rows;
+    return rows.map((r) => ({ ...r, msg_image_urls: parseJsonColumn(r.msg_image_urls) }));
 }
 
 const MAX_IMAGES_PER_MESSAGE = 6; // กันแนบรูปเยอะเกินไปต่อ 1 ข้อความ (ต้องตรงกับ .array("images", N) ที่ route)
@@ -184,7 +192,7 @@ async function insertMessage({ convId, senderType, staffId, text, files }) {
         "SELECT msg_id, msg_sender_type, msg_text, msg_image_urls, msg_created_at FROM tb_chat_messages WHERE msg_id = ?",
         [msg_id]
     );
-    return row;
+    return { ...row, msg_image_urls: parseJsonColumn(row.msg_image_urls) };
 }
 
 // POST /store/chat/conversation/:convId/messages — ฝั่งลูกค้าส่งข้อความ (multipart: text ไม่บังคับ, images
