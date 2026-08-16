@@ -19,7 +19,14 @@ async function getAll(req, res, next) {
 
         const conditions = ["p.prod_name LIKE ?"];
         const params = [search];
-        if (status) { conditions.push("p.prod_status = ?"); params.push(status); }
+        if (status) {
+            conditions.push("p.prod_status = ?");
+            params.push(status);
+        } else {
+            // ไม่ระบุ status มา = มุมมองเริ่มต้นของหน้าจัดการหลัก ไม่โชว์ของที่เก็บเข้าคลังแล้วปนอยู่ด้วย
+            // ต้องเจาะจง ?status=archived เท่านั้นถึงจะเห็น (ดูหน้า /products/archived)
+            conditions.push("p.prod_status != 'archived'");
+        }
         if (categoryId) { conditions.push("p.prod_category_id = ?"); params.push(categoryId); }
         const whereClause = conditions.join(" AND ");
 
@@ -196,6 +203,19 @@ async function remove(req, res, next) {
             req.params.id,
         ]);
 
+        // เก็บ path รูปคำถาม+ตัวเลือกทั้งหมดของ product นี้ไว้ก่อนลบ เพราะ ON DELETE CASCADE จะลบแถว
+        // tb_questions/tb_choices ทิ้งไปเลย ถ้าไม่ query เก็บไว้ก่อนจะไม่มีทางรู้ path ไฟล์เพื่อไปลบตามทีหลัง
+        const [questionImageRows] = await pool.query(
+            "SELECT ques_image_url FROM tb_questions WHERE ques_product_id = ? AND ques_image_url IS NOT NULL",
+            [req.params.id]
+        );
+        const [choiceImageRows] = await pool.query(
+            `SELECT c.cho_image_url FROM tb_choices c
+             JOIN tb_questions q ON q.ques_id = c.cho_question_id
+             WHERE q.ques_product_id = ? AND c.cho_image_url IS NOT NULL`,
+            [req.params.id]
+        );
+
         // ลบ product แล้วคำถาม+ตัวเลือกทั้งหมดของมันหายไปด้วย (ON DELETE CASCADE บน tb_questions)
         // เพราะคำถามไม่มีความหมายแยกจาก product ของมันเลย ต่างจาก entitlement/attempt/order_items ที่ยังกัน
         // ด้วย RESTRICT ไว้เหมือนเดิม เพราะเป็นประวัติทางธุรกิจจริงของลูกค้าที่ไม่ควรหายไปเงียบๆ — RESTRICT บน
@@ -203,16 +223,57 @@ async function remove(req, res, next) {
         // ผูกอยู่ได้เลย ตัดปัญหา settlePaidOrder ไปเจอ product ที่หายไปกลางทางตอนออเดอร์เก่านั้นจ่ายเงินสำเร็จ
         await pool.query("DELETE FROM tb_products WHERE prod_id = ?", [req.params.id]);
 
-        // ลบไฟล์รูปหน้าปกทิ้งด้วย ไม่ให้ค้างอยู่ใน uploads/ เปล่าๆ หลังลบ product
+        // ลบไฟล์รูปหน้าปก + รูปคำถาม/ตัวเลือกทั้งหมดทิ้งด้วย ไม่ให้ค้างอยู่ใน uploads/ เปล่าๆ หลังลบ product
         if (rows[0]?.prod_cover_url) {
             await fs.unlink(resolveUploadPath(rows[0].prod_cover_url)).catch(() => {});
         }
+        await Promise.all([
+            ...questionImageRows.map((r) => fs.unlink(resolveUploadPath(r.ques_image_url)).catch(() => {})),
+            ...choiceImageRows.map((r) => fs.unlink(resolveUploadPath(r.cho_image_url)).catch(() => {})),
+        ]);
 
         res.status(204).end();
     } catch (err) {
         if (err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED") {
-            return res.status(409).json({ message: "ไม่สามารถลบชุดข้อสอบนี้ได้ เพราะมีสิทธิ์การเข้าถึง คำสั่งซื้อ หรือประวัติการทำข้อสอบผูกอยู่" });
+            return res.status(409).json({
+                message: "ไม่สามารถลบชุดข้อสอบนี้ได้ เพราะมีสิทธิ์การเข้าถึง คำสั่งซื้อ หรือประวัติการทำข้อสอบผูกอยู่ — ใช้ปุ่ม \"เก็บเข้าคลัง\" แทนได้ ซ่อนจากลูกค้าโดยไม่กระทบสิทธิ์เดิม",
+            });
         }
+        next(err);
+    }
+}
+
+// สลับ archive/กู้คืนแบบเบาๆ (แค่เปลี่ยน prod_status) ไม่ต้องส่งฟอร์มเต็มเหมือน update() ปกติที่บังคับ
+// ต้องมีชื่อ/ราคา/ฯลฯ ครบ — ใช้เป็นทางเลือกแทนการลบจริงตอนมี entitlement/order/package ผูกอยู่จนลบไม่ได้
+// (product ที่ archived แล้วจะหายไปจากทุกจุดที่ลูกค้าเห็น เพราะทุก query ฝั่งลูกค้ากรอง prod_status='published'
+// อยู่แล้ว แต่ entitlement เดิมของลูกค้าที่ซื้อไปแล้วยังใช้งานได้ปกติ ไม่ถูกกระทบ) กู้คืนกลับไปที่ 'draft' เสมอ
+// (ไม่ใช่ 'published' ตรงๆ) บังคับให้แอดมินต้องกดเผยแพร่ใหม่เองผ่านฟอร์มแก้ไขปกติ กันเผยแพร่คืนโดยไม่ตั้งใจ
+async function setStatus(req, res, next) {
+    try {
+        const { prod_status } = req.body;
+        if (!["archived", "draft"].includes(prod_status)) {
+            return res.status(400).json({ message: "สถานะไม่ถูกต้อง" });
+        }
+
+        if (prod_status === "archived") {
+            // กันเก็บเข้าคลังทั้งที่ยังอยู่ในแพ็กเกจที่เผยแพร่อยู่ — ไม่งั้น checkout ของแพ็กเกจนั้นจะพังทันที
+            // เพราะ checkout() เช็คว่าทุก product ในแพ็กเกจต้อง prod_status='published' ครบทุกชิ้น
+            const [pkgRows] = await pool.query(
+                `SELECT pkg.pkg_name FROM tb_package_items pi
+                 JOIN tb_packages pkg ON pkg.pkg_id = pi.pki_package_id
+                 WHERE pi.pki_product_id = ? AND pkg.pkg_status = 'published'`,
+                [req.params.id]
+            );
+            if (pkgRows.length > 0) {
+                return res.status(409).json({
+                    message: `ไม่สามารถเก็บเข้าคลังได้ เพราะยังอยู่ในแพ็กเกจที่เผยแพร่อยู่: ${pkgRows.map((r) => r.pkg_name).join(", ")} — กรุณาเอาออกจากแพ็กเกจก่อน`,
+                });
+            }
+        }
+
+        await pool.query("UPDATE tb_products SET prod_status = ? WHERE prod_id = ?", [prod_status, req.params.id]);
+        res.json({ message: prod_status === "archived" ? "เก็บเข้าคลังชุดข้อสอบแล้ว" : "กู้คืนชุดข้อสอบแล้ว" });
+    } catch (err) {
         next(err);
     }
 }
@@ -297,4 +358,4 @@ async function uploadCover(req, res, next) {
     }
 }
 
-module.exports = { getAll, getOne, create, update, remove, uploadCover, preview };
+module.exports = { getAll, getOne, create, update, remove, setStatus, uploadCover, preview };

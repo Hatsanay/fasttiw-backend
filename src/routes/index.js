@@ -90,6 +90,7 @@ router.get("/V1/products/:id", requireAuth, requirePermission("productsManagemen
 router.post("/V1/products", requireAuth, requirePermission("createProduct"), productController.create);
 router.put("/V1/products/:id", requireAuth, requirePermission("editProduct"), productController.update);
 router.delete("/V1/products/:id", requireAuth, requirePermission("deleteProduct"), productController.remove);
+router.put("/V1/products/:id/status", requireAuth, requirePermission("deleteProduct"), productController.setStatus);
 router.put(
     "/V1/products/:id/image",
     requireAuth,
@@ -136,6 +137,14 @@ router.put(
     requireAuth,
     requirePermission("editProduct"),
     questionController.update
+);
+// ต้องมาก่อน route "/questions/:id" (DELETE) ด้านล่างเสมอ ไม่งั้น Express จะจับคำว่า "batch" เป็นค่า :id
+// ของ route เดี่ยวไปก่อน (path ยาวเท่ากันทั้งคู่ — สั้นกว่า/general กว่าต้องมาทีหลังเสมอ)
+router.delete(
+    "/V1/products/:productId/questions/batch",
+    requireAuth,
+    requirePermission("deleteProduct"),
+    questionController.removeBatch
 );
 router.delete(
     "/V1/products/:productId/questions/:id",

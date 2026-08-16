@@ -412,12 +412,62 @@ async function removeChoiceImage(req, res, next) {
 
 async function remove(req, res, next) {
     try {
+        // เก็บ path รูปคำถาม+รูปตัวเลือกไว้ก่อนลบ เพราะ ON DELETE CASCADE บน tb_choices จะลบแถวทิ้งไปเลย
+        // ถ้าไม่ query เก็บไว้ก่อนจะไม่มีทางรู้ path ไฟล์เพื่อไปลบตามทีหลัง
+        const [[quesRow]] = await pool.query("SELECT ques_image_url FROM tb_questions WHERE ques_id = ?", [req.params.id]);
+        const [choiceRows] = await pool.query(
+            "SELECT cho_image_url FROM tb_choices WHERE cho_question_id = ? AND cho_image_url IS NOT NULL",
+            [req.params.id]
+        );
+
         // ลบคำถามได้เลย — tb_choices ผูก ON DELETE CASCADE ไว้แล้ว ตัวเลือกจะหายตามไปเองโดยไม่ต้องลบมือ
         await pool.query("DELETE FROM tb_questions WHERE ques_id = ?", [req.params.id]);
+
+        // ลบไฟล์รูปคำถาม+รูปตัวเลือกทั้งหมดทิ้งด้วย ไม่ให้ค้างอยู่ใน uploads/ เปล่าๆ หลังลบคำถาม
+        if (quesRow?.ques_image_url) {
+            await fs.unlink(resolveUploadPath(quesRow.ques_image_url)).catch(() => {});
+        }
+        await Promise.all(choiceRows.map((r) => fs.unlink(resolveUploadPath(r.cho_image_url)).catch(() => {})));
+
         res.status(204).end();
     } catch (err) {
         if (err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED") {
             return res.status(409).json({ message: "ไม่สามารถลบคำถามนี้ได้ เพราะมีการทำข้อสอบผูกอยู่แล้ว" });
+        }
+        next(err);
+    }
+}
+
+// ลบหลายข้อพร้อมกัน (ติ๊กเลือกจากหน้ารายการคำถาม) — DELETE ... WHERE ques_id IN (?) เป็น statement เดียว
+// ถ้ามีข้อไหนติด RESTRICT (มีคนทำข้อสอบไปแล้ว) ทั้ง statement จะ rollback หมด ไม่ลบบางส่วนค้างไว้ครึ่งๆ
+// กลางๆ — เหมือนพฤติกรรม remove() เดี่ยวๆ แค่ขยายเป็นหลายข้อ
+async function removeBatch(req, res, next) {
+    try {
+        const { ques_ids } = req.body;
+        if (!Array.isArray(ques_ids) || ques_ids.length === 0) {
+            return res.status(400).json({ message: "กรุณาเลือกคำถามที่จะลบ" });
+        }
+
+        const [quesRows] = await pool.query(
+            "SELECT ques_image_url FROM tb_questions WHERE ques_id IN (?) AND ques_image_url IS NOT NULL",
+            [ques_ids]
+        );
+        const [choiceRows] = await pool.query(
+            "SELECT cho_image_url FROM tb_choices WHERE cho_question_id IN (?) AND cho_image_url IS NOT NULL",
+            [ques_ids]
+        );
+
+        const [result] = await pool.query("DELETE FROM tb_questions WHERE ques_id IN (?)", [ques_ids]);
+
+        await Promise.all([
+            ...quesRows.map((r) => fs.unlink(resolveUploadPath(r.ques_image_url)).catch(() => {})),
+            ...choiceRows.map((r) => fs.unlink(resolveUploadPath(r.cho_image_url)).catch(() => {})),
+        ]);
+
+        res.json({ message: `ลบคำถาม ${result.affectedRows} ข้อสำเร็จ` });
+    } catch (err) {
+        if (err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED") {
+            return res.status(409).json({ message: "ไม่สามารถลบได้ เพราะมีคำถามบางข้อที่เลือกมีการทำข้อสอบผูกอยู่แล้ว" });
         }
         next(err);
     }
@@ -619,7 +669,7 @@ function cancelImportJob(req, res) {
 }
 
 module.exports = {
-    getAll, getOne, create, createBatch, update, remove,
+    getAll, getOne, create, createBatch, update, remove, removeBatch,
     uploadImage, removeImage,
     uploadChoiceImage, removeChoiceImage,
     importFile, getImportStatus, cancelImportJob, downloadTemplate,
