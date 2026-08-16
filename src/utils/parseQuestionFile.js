@@ -6,6 +6,7 @@ const CHOICE_COLUMNS = Array.from({ length: MAX_CHOICES }, (_, i) => `ตัว�
 const WRONG_REASON_COLUMNS = Array.from({ length: MAX_CHOICES }, (_, i) => `เหตุผลผิด${i + 1}`);
 const QUESTION_IMAGE_COLUMN = "รูปคำถาม";
 const CHOICE_IMAGE_COLUMNS = Array.from({ length: MAX_CHOICES }, (_, i) => `รูปตัวเลือก${i + 1}`);
+const QUESTION_PASSAGE_COLUMN = "บทความร่วม";
 const REQUIRED_COLUMNS = ["คำถาม", "ข้อที่ถูก", "ตัวเลือก1", "ตัวเลือก2"];
 
 async function loadWorkbook(buffer, filename) {
@@ -35,9 +36,15 @@ function extractImagesByCell(worksheet, media) {
     return byCell;
 }
 
-function cellText(row, colIndex) {
+// resolveMerge: อ่านค่าจากเซลล์บนสุดของกลุ่ม merge แทนตัวเอง ถ้าเซลล์นี้ถูก merge ไว้ (isMerged/master ของ
+// ExcelJS — ยืนยันด้วย script ทดสอบจริงแล้วว่า master.value/master.row เป็นค่าที่ใช้ได้เสมอ) ใช้เฉพาะคอลัมน์
+// "บทความร่วม" เท่านั้น (ดู QUESTION_PASSAGE_COLUMN) คอลัมน์อื่นไม่แตะพฤติกรรมเดิม กันกรณี merge เผลอที่คอลัมน์
+// อื่นไปบดบังข้อมูลที่ตั้งใจกรอกแยกรายแถว
+function cellText(row, colIndex, { resolveMerge = false } = {}) {
     if (!colIndex) return "";
-    const value = row.getCell(colIndex).value;
+    let cell = row.getCell(colIndex);
+    if (resolveMerge && cell.isMerged) cell = cell.master;
+    const value = cell.value;
     if (value == null) return "";
 
     let text;
@@ -50,6 +57,16 @@ function cellText(row, colIndex) {
         text = String(value);
     }
     return text.trim();
+}
+
+// แถวบนสุดของกลุ่มที่ merge เซลล์คอลัมน์ "บทความร่วม" ไว้ร่วมกัน (หรือ null ถ้าแถวนี้ไม่ได้เป็นส่วนหนึ่งของ
+// กลุ่มใดๆ) ใช้เป็น "รหัสกลุ่ม" กลายๆ — ทั้งข้อความบทความและรูปประกอบที่วางไว้ที่แถวบนสุดจะถูกดึงไปใช้กับ
+// ทุกแถวในกลุ่มเดียวกันโดยอัตโนมัติ แอดมินจึงกรอกบทความ/แนบรูปครั้งเดียวที่แถวแรกของกลุ่ม แล้ว merge เซลล์
+// คอลัมน์นี้คลุมแถวคำถามทั้งหมดที่ใช้บทความ/รูปร่วมกันได้เลย
+function passageGroupFirstRow(row, passageColIndex) {
+    if (!passageColIndex) return null;
+    const cell = row.getCell(passageColIndex);
+    return cell.isMerged ? cell.master.row : null;
 }
 
 // นำเข้าคำถามจากไฟล์ CSV/Excel — แถวแรกเป็นหัวตาราง คอลัมน์ที่รองรับ:
@@ -83,12 +100,16 @@ async function parseQuestionFile(buffer, filename) {
     const questions = [];
     const errors = [];
 
+    const passageColIndex = colIndex[QUESTION_PASSAGE_COLUMN];
+
     for (let r = 2; r <= sheet.rowCount; r++) {
         const row = sheet.getRow(r);
         const questionText = cellText(row, colIndex["คำถาม"]);
         const explanation = cellText(row, colIndex["วิธีคิด"]);
         const correctRaw = cellText(row, colIndex["ข้อที่ถูก"]);
         const topicName = cellText(row, colIndex["หมวดหมู่"]) || null;
+        const sharedPassage = cellText(row, passageColIndex, { resolveMerge: true });
+        const groupFirstRow = passageGroupFirstRow(row, passageColIndex);
         const rawChoices = CHOICE_COLUMNS.map((col, ci) => ({
             text: cellText(row, colIndex[col]),
             wrongReason: cellText(row, colIndex[WRONG_REASON_COLUMNS[ci]]),
@@ -129,11 +150,19 @@ async function parseQuestionFile(buffer, filename) {
             continue;
         }
 
+        // ถ้าแถวนี้อยู่ในกลุ่ม merge ของ "บทความร่วม" ให้เอารูปที่วางไว้ที่แถวบนสุดของกลุ่ม (รูปตาราง/กราฟ
+        // ที่ใช้ร่วมกันทั้งกลุ่ม) มาก่อน ถ้าไม่มีรูปที่แถวบนสุด (กลุ่มนี้ใช้บทความข้อความล้วนๆ ไม่มีรูป) ค่อย fallback
+        // ไปดูรูปที่วางไว้เฉพาะแถวของตัวเอง (เผื่อโจทย์ข้อนั้นมีรูปประกอบเพิ่มเติมนอกเหนือจากบทความร่วม)
+        const questionImage =
+            (groupFirstRow && imagesByCell[`${groupFirstRow}:${colIndex[QUESTION_IMAGE_COLUMN]}`]) ||
+            imagesByCell[`${r}:${colIndex[QUESTION_IMAGE_COLUMN]}`] ||
+            null;
+
         questions.push({
-            questionText,
+            questionText: sharedPassage ? `${sharedPassage}\n\n${questionText}` : questionText,
             explanation: explanation || null,
             topicName,
-            image: imagesByCell[`${r}:${colIndex[QUESTION_IMAGE_COLUMN]}`] ?? null,
+            image: questionImage,
             choices: choices.map((c, ci) => ({
                 text: c.text,
                 isCorrect: ci === correctIndex - 1,
@@ -148,5 +177,5 @@ async function parseQuestionFile(buffer, filename) {
 
 module.exports = {
     parseQuestionFile, MAX_CHOICES, CHOICE_COLUMNS, WRONG_REASON_COLUMNS, REQUIRED_COLUMNS,
-    QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS,
+    QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS, QUESTION_PASSAGE_COLUMN,
 };

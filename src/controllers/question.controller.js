@@ -5,6 +5,7 @@ const pool = require("../config/db");
 const { generateIds } = require("../utils/generateId");
 const { parseQuestionFile } = require("../utils/parseQuestionFile");
 const { generateQuestionTemplate } = require("../utils/generateQuestionTemplate");
+const { generateQuestionExport } = require("../utils/generateQuestionExport");
 const { resolveUploadPath } = require("../utils/uploads");
 
 const QUESTION_IMAGE_DIR = path.join(__dirname, "..", "..", "uploads", "questions");
@@ -55,6 +56,71 @@ async function getAll(req, res, next) {
         }));
 
         res.json({ data, total });
+    } catch (err) {
+        next(err);
+    }
+}
+
+// ส่งออกคำถามทั้งหมดของ product เป็นไฟล์ .xlsx รูปแบบคอลัมน์เดียวกับเทมเพลตนำเข้าเป๊ะ (ใช้ HEADER_COLUMNS
+// เดียวกัน ดู generateQuestionExport.js) เพื่อให้ export แล้วนำกลับไป import ใหม่ได้ทันที เช่น ย้ายชุดข้อสอบ
+// ไปอีก product, แก้ไขนอกระบบทีละหลายข้อสะดวกกว่าฟอร์มทีละข้อ, หรือสำรองไว้ก่อนแก้ไขใหญ่
+// คอลัมน์ "บทความร่วม" จะว่างเสมอ — ดูเหตุผลที่ comment บนสุดของ generateQuestionExport.js
+async function exportQuestions(req, res, next) {
+    try {
+        const [[product]] = await pool.query(
+            "SELECT prod_id, prod_name FROM tb_products WHERE prod_id = ?",
+            [req.params.productId]
+        );
+        if (!product) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
+
+        const [questions] = await pool.query(
+            `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, t.tpc_name AS ques_topic_name
+             FROM tb_questions q
+             LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
+             WHERE q.ques_product_id = ?
+             ORDER BY q.ques_order`,
+            [req.params.productId]
+        );
+        if (questions.length === 0) return res.status(400).json({ message: "ชุดข้อสอบนี้ยังไม่มีคำถาม ไม่มีอะไรให้ส่งออก" });
+
+        const [choices] = await pool.query(
+            `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url
+             FROM tb_choices WHERE cho_question_id IN (?) ORDER BY cho_order`,
+            [questions.map((q) => q.ques_id)]
+        );
+
+        // รูปประกอบทั้งหมดถูกบันทึกเป็น .webp เสมอ (ดู saveResizedImage) กำหนด extension ตรงๆ ได้เลย ไม่ต้อง
+        // เดาจากนามสกุลไฟล์ — ไฟล์หายจาก disk (ถูกลบมือ/ย้ายเซิร์ฟเวอร์) ก็แค่ข้ามรูปนั้นไป ไม่ทำให้ export ทั้งชุดพัง
+        async function loadImage(url) {
+            if (!url) return null;
+            try {
+                return { buffer: await fs.readFile(resolveUploadPath(url)), extension: "webp" };
+            } catch {
+                return null;
+            }
+        }
+
+        const exportRows = [];
+        for (const q of questions) {
+            const questionChoices = choices.filter((c) => c.cho_question_id === q.ques_id);
+            exportRows.push({
+                questionText: q.ques_text,
+                explanation: q.ques_explanation,
+                topicName: q.ques_topic_name,
+                image: await loadImage(q.ques_image_url),
+                choices: await Promise.all(questionChoices.map(async (c) => ({
+                    text: c.cho_text,
+                    isCorrect: !!c.cho_is_correct,
+                    wrongReason: c.cho_wrong_reason,
+                    image: await loadImage(c.cho_image_url),
+                }))),
+            });
+        }
+
+        const buffer = await generateQuestionExport(exportRows);
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="export_questions_${product.prod_id}.xlsx"`);
+        res.send(buffer);
     } catch (err) {
         next(err);
     }
@@ -672,5 +738,5 @@ module.exports = {
     getAll, getOne, create, createBatch, update, remove, removeBatch,
     uploadImage, removeImage,
     uploadChoiceImage, removeChoiceImage,
-    importFile, getImportStatus, cancelImportJob, downloadTemplate,
+    importFile, getImportStatus, cancelImportJob, downloadTemplate, exportQuestions,
 };

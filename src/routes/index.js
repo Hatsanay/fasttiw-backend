@@ -114,6 +114,14 @@ router.get(
     requirePermission("productsManagement"),
     questionController.getAll
 );
+// ต้องมาก่อน route "/questions/:id" (GET) ด้านล่างเสมอ ไม่งั้น Express จะจับคำว่า "export" เป็นค่า :id
+// ของ route เดี่ยวไปก่อน (path ยาวเท่ากันทั้งคู่ — สั้นกว่า/general กว่าต้องมาทีหลังเสมอ เหมือน batch ด้านล่าง)
+router.get(
+    "/V1/products/:productId/questions/export",
+    requireAuth,
+    requirePermission("productsManagement"),
+    questionController.exportQuestions
+);
 router.get(
     "/V1/products/:productId/questions/:id",
     requireAuth,
