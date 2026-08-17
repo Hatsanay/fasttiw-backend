@@ -1,14 +1,17 @@
-const crypto = require("crypto");
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { findValidCoupon, incrementUsage } = require("./coupon.controller");
 const { grantOrRenewProduct, calculateDiscount, recordSale } = require("./entitlement.controller");
 const { fetchSampleQuestions, buildQuestionPayload } = require("./attempt.controller");
-const omiseClient = require("../utils/omiseClient");
+const stripeClient = require("../utils/stripeClient");
 const settingsController = require("./settings.controller");
 const { getEffectivePrice } = require("../utils/pricing");
 
-const PROMPTPAY_QR_TTL_MS = 24 * 60 * 60 * 1000; // Omise ตั้ง QR หมดอายุ default 24 ชม.
+// Stripe ไม่มี field วันหมดอายุ QR ของ PromptPay ให้เหมือน Omise (ตรวจสอบแล้วจาก docs.stripe.com — ไม่มี
+// payment_method_options[promptpay][expires_after_seconds] แบบที่ Pix มี และ next_action.promptpay_display_qr_code
+// ก็ไม่มี field หมดอายุเลย) จึงกำหนด TTL เองฝั่งเรา แล้วให้ jobs/orderExpirySweep.js เป็นคนยกเลิก PaymentIntent
+// ที่ค้างเกินเวลาแทน (เช็คสถานะจริงกับ Stripe ก่อนยกเลิกทุกครั้ง กันเคส race ที่ลูกค้าเพิ่งจ่ายสำเร็จไปพอดี)
+const PROMPTPAY_QR_TTL_MS = 60 * 60 * 1000; // 1 ชม. — ตัดสินใจร่วมกับผู้ใช้แล้ว (ไม่มีตัวเลขอ้างอิงจาก Stripe ให้ใช้)
 
 const SAMPLE_QUESTION_COUNT = 10;
 
@@ -290,28 +293,37 @@ async function checkout(req, res, next) {
         let paymentPayload = {};
         if (total === 0) {
             await settlePaidOrder(ord_id);
-        } else if (omiseClient.isConfigured()) {
+        } else if (stripeClient.isConfigured()) {
             try {
-                const charge = await omiseClient.createPromptPayCharge({
+                // PromptPay ของ Stripe บังคับต้องมี billing_details.email เสมอ (ทดสอบจริงแล้วเจอ error
+                // "Missing required param: billing_details[email]" ถ้าไม่ส่ง) ใช้เพื่อให้ Stripe ติดต่อลูกค้า
+                // กรณีต้องคืนเงิน (ดู docs.stripe.com/payments/promptpay#refunds) — สมัครสมาชิกบังคับกรอกอีเมล
+                // อยู่แล้ว (ดู customerAuth.controller.js) จึงควรมีเสมอ แต่เผื่อ null (เช่น บัญชีที่แอดมินสร้างเอง)
+                const [[customer]] = await pool.query("SELECT cus_email FROM tb_customers WHERE cus_id = ?", [req.customer.cus_id]);
+                if (!customer?.cus_email) throw new Error("บัญชีนี้ยังไม่มีอีเมล กรุณาเพิ่มอีเมลในหน้าบัญชีก่อนชำระเงินผ่าน QR");
+
+                const intent = await stripeClient.createPromptPayIntent({
                     amountSatang: Math.round(total * 100),
                     orderId: ord_id,
+                    email: customer.cus_email,
                 });
-                const qrImageUrl = charge?.source?.scannable_code?.image?.download_uri ?? null;
-                // ใช้ charge.expires_at จริงจาก Omise เป็นหลัก (ยืนยันด้วย charge จริงแล้วว่าเป็น ISO string
-                // ห่างจาก created_at 24 ชม.เป๊ะ) เผื่อไว้ด้วยค่าคำนวณเองกรณี field นี้หายไปแบบไม่คาดคิด
-                const qrExpiresAt = charge?.expires_at ? new Date(charge.expires_at) : new Date(Date.now() + PROMPTPAY_QR_TTL_MS);
+                const qrCode = intent?.next_action?.promptpay_display_qr_code;
+                const qrImageUrl = qrCode?.image_url_png ?? null;
+                // ไม่มี field วันหมดอายุจาก Stripe ให้เหมือน Omise — คำนวณเองด้วย TTL คงที่เสมอ (ดูคอมเมนต์
+                // บนสุดของไฟล์นี้ที่ PROMPTPAY_QR_TTL_MS)
+                const qrExpiresAt = new Date(Date.now() + PROMPTPAY_QR_TTL_MS);
                 await pool.query(
                     "UPDATE tb_orders SET ord_omise_charge_id = ?, ord_qr_image_url = ?, ord_qr_expires_at = ? WHERE ord_id = ?",
-                    [charge.id, qrImageUrl, qrExpiresAt, ord_id]
+                    [intent.id, qrImageUrl, qrExpiresAt, ord_id]
                 );
                 paymentPayload = { qr_image_url: qrImageUrl, qr_expires_at: qrExpiresAt };
             } catch (err) {
-                // ออเดอร์ pending ถูกสร้างไปแล้ว แค่สร้าง QR ไม่สำเร็จ (เช่น Omise ล่มชั่วคราว) — ไม่ throw
+                // ออเดอร์ pending ถูกสร้างไปแล้ว แค่สร้าง QR ไม่สำเร็จ (เช่น Stripe ล่มชั่วคราว) — ไม่ throw
                 // ทิ้งทั้ง checkout เพราะออเดอร์ยังใช้ต่อได้ผ่านหน้า "รอการยืนยัน" + แอดมิน manual confirm
-                console.error("Omise createPromptPayCharge failed:", err.message);
+                console.error("Stripe createPromptPayIntent failed:", err.message);
             }
         }
-        // omiseClient ยังไม่ configure (ยังไม่มีบัญชี Omise ตอนนี้) — ปล่อยผ่านเงียบๆ ไม่เรียก Omise เลย
+        // stripeClient ยังไม่ configure (ยังไม่ตั้งค่า STRIPE_SECRET_KEY) — ปล่อยผ่านเงียบๆ ไม่เรียก Stripe เลย
         // order ยังสร้างสำเร็จปกติ ค้างสถานะ pending รอ mock confirmPayment (ถ้าเปิดไว้ใน dev) หรือ
         // แอดมิน manual confirm แทน
 
@@ -376,10 +388,10 @@ async function settlePaidOrder(orderId) {
     }
     if (coupon) await incrementUsage(coupon.cpn_id);
 
-    // ค่าธรรมเนียม gateway หักเฉพาะออเดอร์ที่มี Omise charge จริงเท่านั้น (เช็คจาก ord_omise_charge_id
-    // ไม่ใช่ ord_total > 0) เพราะออเดอร์อาจค้าง pending แบบมียอดเงินแต่ไม่เคยถูกส่งไป Omise เลยก็ได้
-    // (เช่น Omise ล่มตอน checkout, หรือยังไม่ตั้งค่า Omise) ถ้าแอดมิน force-confirm ออเดอร์แบบนั้น
-    // ทีหลังต้อง "ไม่" โดนหักค่าธรรมเนียมผี เพราะไม่มีการหักจริงเกิดขึ้นเลย
+    // ค่าธรรมเนียม gateway หักเฉพาะออเดอร์ที่มี Stripe payment intent จริงเท่านั้น (เช็คจาก ord_omise_charge_id
+    // ซึ่งยังคงชื่อคอลัมน์เดิมไว้ แต่เก็บ Stripe payment intent id แล้ว — ไม่ใช่ ord_total > 0) เพราะออเดอร์
+    // อาจค้าง pending แบบมียอดเงินแต่ไม่เคยถูกส่งไป Stripe เลยก็ได้ (เช่น Stripe ล่มตอน checkout, หรือยังไม่ตั้งค่า
+    // Stripe) ถ้าแอดมิน force-confirm ออเดอร์แบบนั้นทีหลังต้อง "ไม่" โดนหักค่าธรรมเนียมผี เพราะไม่มีการหักจริงเกิดขึ้นเลย
     const feePercent = await settingsController.getPaymentGatewayFeePercent();
     const gatewayFee = order.ord_omise_charge_id ? (Number(order.ord_total) * feePercent) / 100 : 0;
 
@@ -391,13 +403,90 @@ async function settlePaidOrder(orderId) {
     return { alreadySettled: false };
 }
 
+// ─── cancelOrder — logic กลางที่ "ยกเลิกคำสั่งซื้อที่ยังไม่จ่าย" ต้องเรียกจุดเดียว เหมือน settlePaidOrder
+// ใช้ร่วมกันทั้งลูกค้ายกเลิกเอง (cancelMyOrder) และแอดมินยกเลิกจากหน้า /orders (order.controller.js)
+// ไม่เช็ค ord_customer_id ในนี้ตั้งใจเหมือนกัน — ผู้เรียกต้องเช็คความเป็นเจ้าของออเดอร์เองก่อนถ้าจำเป็น
+//
+// สำคัญ: ต้องเช็คสถานะจริงกับ Stripe ก่อนยกเลิกเสมอ (ถ้ามี payment intent ผูกอยู่) กันเคส race ที่ลูกค้า
+// กดยกเลิกพอดีจังหวะเดียวกับที่เพิ่งจ่ายสำเร็จจริง (สแกน QR ไปแล้วแต่ webhook ยังมาไม่ถึง) — ถ้ายกเลิกไปตรงๆ
+// โดยไม่เช็ค จะเกิดเคสร้ายแรง: ลูกค้าจ่ายเงินจริงไปแล้ว (เงินออกจากบัญชีจริง) แต่ order ถูกยกเลิกไปก่อน พอ
+// webhook มาถึงทีหลัง settlePaidOrder() จะเจอว่า ord_status ไม่ใช่ 'pending' แล้ว (alreadySettled เงียบๆ)
+// ไม่ให้สิทธิ์อะไรเลย กลายเป็นลูกค้าเสียเงินฟรีไม่ได้อะไรตอบแทน — ถ้าเช็คแล้วเจอว่า Stripe บอกว่า succeeded
+// จริง ต้อง settle ให้สิทธิ์แทนการยกเลิก แล้วแจ้ง error กลับไปว่ายกเลิกไม่ได้เพราะจ่ายสำเร็จไปแล้วพอดี
+// (ใช้ pattern เดียวกับ jobs/orderExpirySweep.js ที่ตรวจสอบก่อนยกเลิกอัตโนมัติเป๊ะ)
+async function cancelOrder(orderId) {
+    const [rows] = await pool.query(
+        "SELECT ord_id, ord_status, ord_total, ord_omise_charge_id FROM tb_orders WHERE ord_id = ?",
+        [orderId]
+    );
+    const order = rows[0];
+    if (!order) {
+        const err = new Error("ไม่พบคำสั่งซื้อนี้");
+        err.status = 404;
+        throw err;
+    }
+    if (order.ord_status !== "pending") {
+        const err = new Error("คำสั่งซื้อนี้ไม่ได้อยู่ในสถานะรอชำระเงินแล้ว ไม่สามารถยกเลิกได้");
+        err.status = 400;
+        throw err;
+    }
+
+    if (order.ord_omise_charge_id && stripeClient.isConfigured()) {
+        const liveIntent = await stripeClient.getPaymentIntent(order.ord_omise_charge_id);
+        if (liveIntent?.status === "succeeded") {
+            const expectedSatang = Math.round(Number(order.ord_total) * 100);
+            if (liveIntent.amount === expectedSatang) {
+                await settlePaidOrder(order.ord_id);
+            }
+            const err = new Error("คำสั่งซื้อนี้ชำระเงินสำเร็จไปแล้วพอดี ไม่สามารถยกเลิกได้ กรุณารีเฟรชหน้าใหม่");
+            err.status = 409;
+            throw err;
+        }
+    }
+
+    // atomic claim เหมือน settlePaidOrder — กันกดยกเลิกซ้ำ/ยกเลิกพร้อมกันหลาย request
+    const [claimResult] = await pool.query(
+        "UPDATE tb_orders SET ord_status = 'cancelled' WHERE ord_id = ? AND ord_status = 'pending'",
+        [order.ord_id]
+    );
+    if (claimResult.affectedRows === 0) {
+        const err = new Error("คำสั่งซื้อนี้ไม่ได้อยู่ในสถานะรอชำระเงินแล้ว ไม่สามารถยกเลิกได้");
+        err.status = 400;
+        throw err;
+    }
+
+    if (order.ord_omise_charge_id && stripeClient.isConfigured()) {
+        await stripeClient.cancelPaymentIntent(order.ord_omise_charge_id);
+    }
+
+    return { cancelled: true };
+}
+
+// ลูกค้ายกเลิกคำสั่งซื้อของตัวเองที่ยังไม่จ่าย — ต้องเช็คความเป็นเจ้าของออเดอร์ก่อนเรียก cancelOrder() เสมอ
+// (ต่างจาก settlePaidOrder ที่ webhook เรียกได้โดยไม่ผ่าน req.customer)
+async function cancelMyOrder(req, res, next) {
+    try {
+        const [rows] = await pool.query(
+            "SELECT ord_id FROM tb_orders WHERE ord_id = ? AND ord_customer_id = ?",
+            [req.params.id, req.customer.cus_id]
+        );
+        if (!rows[0]) return res.status(404).json({ message: "ไม่พบคำสั่งซื้อนี้" });
+
+        await cancelOrder(req.params.id);
+        res.json({ message: "ยกเลิกคำสั่งซื้อสำเร็จ" });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ message: err.message });
+        next(err);
+    }
+}
+
 // ─── ยืนยันจ่ายเงิน — จุด "mock" สำหรับ dev/test เท่านั้น ตอบสำเร็จทันทีไม่เช็คอะไรจริง เปิดใช้ได้
-// ก็ต่อเมื่อ ALLOW_MOCK_PAYMENT_CONFIRM=true **และ** ยังไม่ได้ตั้งค่า Omise จริง (สองเงื่อนไขพร้อมกัน —
+// ก็ต่อเมื่อ ALLOW_MOCK_PAYMENT_CONFIRM=true **และ** ยังไม่ได้ตั้งค่า Stripe จริง (สองเงื่อนไขพร้อมกัน —
 // กันหลุดไปใช้งานจริงโดยไม่ตั้งใจ) route ฝั่ง store.routes.js เช็คซ้ำอีกชั้นก่อนจะ mount route นี้ด้วย
 // การ์อยู่ตรงนี้เป็น defense-in-depth เผื่อวันหลังมีคนย้าย/mount route ผิดที่
 async function confirmPayment(req, res, next) {
     try {
-        if (process.env.ALLOW_MOCK_PAYMENT_CONFIRM !== "true" || omiseClient.isConfigured()) {
+        if (process.env.ALLOW_MOCK_PAYMENT_CONFIRM !== "true" || stripeClient.isConfigured()) {
             return res.status(404).json({ message: "ไม่พบ endpoint นี้" });
         }
 
@@ -419,70 +508,46 @@ async function confirmPayment(req, res, next) {
     }
 }
 
-// ─── webhook จริงจาก Omise — public endpoint, Omise ยิงมาเอง ไม่มี customer token แนบมาด้วย ต้อง
+// ─── webhook จริงจาก Stripe — public endpoint, Stripe ยิงมาเอง ไม่มี customer token แนบมาด้วย ต้อง
 // พิสูจน์ตัวตนด้วย signature แทน (ไม่ใช่ req.customer) ตามกฎเหล็กข้อ 2 ใน CLAUDE.md
 //
-// สเปกจาก docs.omise.co (ตรวจสอบสดตอนเขียนโค้ดนี้): header สองตัว Omise-Signature (hex HMAC-SHA256,
-// อาจมีหลายค่าคั่น comma ตอน rotate secret — ต้องลองเทียบทุกค่า) และ Omise-Signature-Timestamp (unix
-// timestamp) payload ที่เซ็นคือ "<timestamp>.<raw body>" เป๊ะๆ (ต้องใช้ req.rawBody ที่เก็บไว้ใน app.js
-// ไม่ใช่ req.body ที่ parse เป็น object แล้ว เพราะ re-serialize อาจได้ byte ไม่ตรงต้นฉบับ) secret จาก
-// dashboard เป็น base64 ต้อง decode ก่อนใช้เป็น HMAC key เทียบด้วย timing-safe compare กันโดน timing attack
-function verifyWebhookSignature(req) {
-    const secret = process.env.OMISE_WEBHOOK_SECRET;
-    const sigHeader = req.headers["omise-signature"];
-    const timestamp = req.headers["omise-signature-timestamp"];
-    if (!secret || !sigHeader || !timestamp || !req.rawBody) return false;
-
-    let key;
-    try {
-        key = Buffer.from(secret, "base64");
-    } catch {
-        return false;
-    }
-    const signedPayload = `${timestamp}.${req.rawBody.toString("utf8")}`;
-    const expected = crypto.createHmac("sha256", key).update(signedPayload).digest("hex");
-    const expectedBuf = Buffer.from(expected, "hex");
-
-    return String(sigHeader).split(",").map((s) => s.trim()).some((sig) => {
-        try {
-            const sigBuf = Buffer.from(sig, "hex");
-            return sigBuf.length === expectedBuf.length && crypto.timingSafeEqual(sigBuf, expectedBuf);
-        } catch {
-            return false;
-        }
-    });
-}
-
+// verify ผ่าน stripeClient.constructWebhookEvent() (ใช้ SDK ทางการแทนเขียน HMAC เอง — Stripe แนะนำแบบนี้
+// เพราะ SDK มี timestamp tolerance กัน replay attack ในตัว) header คือ Stripe-Signature รูปแบบ
+// "t=<timestamp>,v1=<signature>[,v0=...]" ต้องใช้ req.rawBody ที่เก็บไว้ใน app.js เป๊ะๆ เหมือนเดิม
+// (ไม่ใช่ req.body ที่ parse แล้ว เพราะ re-serialize อาจได้ byte ไม่ตรงต้นฉบับ)
 async function handlePaymentWebhook(req, res, next) {
     try {
-        if (!verifyWebhookSignature(req)) {
+        let event;
+        try {
+            event = stripeClient.constructWebhookEvent(req.rawBody, req.headers["stripe-signature"]);
+        } catch (err) {
             return res.status(401).json({ message: "ลายเซ็นไม่ถูกต้อง" });
         }
 
-        const event = req.body ?? {};
-        const chargeId = event?.data?.id;
-        if (event.key !== "charge.complete" || !chargeId) {
-            return res.json({ received: true }); // event อื่นที่ไม่เกี่ยวผลจ่ายเงิน (เช่น charge.create) รับทราบเฉยๆ ไม่ต้องทำอะไร
+        if (event.type !== "payment_intent.succeeded") {
+            return res.json({ received: true }); // event อื่นที่ไม่เกี่ยวผลจ่ายเงิน (เช่น payment_intent.created) รับทราบเฉยๆ ไม่ต้องทำอะไร
         }
+        const intentId = event.data?.object?.id;
+        if (!intentId) return res.json({ received: true });
 
-        // defense-in-depth: ไม่เชื่อ payload ใน webhook เฉยๆ re-fetch สถานะจริงจาก Omise อีกที (กฎเหล็ก
-        // ข้อ 2 บอกให้ verify signature อยู่แล้ว แต่ Omise เองแนะนำให้ยืนยันซ้ำแบบนี้เผื่อ signature รั่ว)
-        const liveCharge = await omiseClient.getCharge(chargeId);
-        if (!liveCharge) return res.status(502).json({ message: "ตรวจสอบสถานะกับ Omise ไม่สำเร็จ" });
-        if (!liveCharge.paid || liveCharge.status !== "successful") {
-            return res.json({ received: true }); // เช่น charge.expire/failed — ไม่ grant สิทธิ์
+        // defense-in-depth: ไม่เชื่อ payload ใน webhook เฉยๆ re-fetch สถานะจริงจาก Stripe อีกที (กฎเหล็ก
+        // ข้อ 2 บอกให้ verify signature อยู่แล้ว แต่ Stripe เองแนะนำให้ยืนยันซ้ำแบบนี้เผื่อ signature รั่ว)
+        const liveIntent = await stripeClient.getPaymentIntent(intentId);
+        if (!liveIntent) return res.status(502).json({ message: "ตรวจสอบสถานะกับ Stripe ไม่สำเร็จ" });
+        if (liveIntent.status !== "succeeded") {
+            return res.json({ received: true }); // ไม่น่าเกิดขึ้นเพราะ event นี้แปลว่า succeeded อยู่แล้ว แต่กันไว้เผื่อสถานะเปลี่ยนไปแล้วระหว่างทาง
         }
 
         const [rows] = await pool.query(
             "SELECT ord_id, ord_total FROM tb_orders WHERE ord_omise_charge_id = ?",
-            [liveCharge.id]
+            [liveIntent.id]
         );
         const order = rows[0];
-        if (!order) return res.status(404).json({ message: "ไม่พบคำสั่งซื้อที่ตรงกับ charge นี้" });
+        if (!order) return res.status(404).json({ message: "ไม่พบคำสั่งซื้อที่ตรงกับ payment intent นี้" });
 
-        // ยืนยันยอดเงินฝั่ง backend เสมอ (กฎเหล็กข้อ 4) — ห้ามเชื่อแค่ status ว่า "successful" เฉยๆ
+        // ยืนยันยอดเงินฝั่ง backend เสมอ (กฎเหล็กข้อ 4) — ห้ามเชื่อแค่ status ว่า "succeeded" เฉยๆ
         const expectedSatang = Math.round(Number(order.ord_total) * 100);
-        if (liveCharge.amount !== expectedSatang || liveCharge.currency !== "THB") {
+        if (liveIntent.amount !== expectedSatang || liveIntent.currency !== "thb") {
             return res.status(409).json({ message: "ยอดเงินไม่ตรงกับคำสั่งซื้อ" });
         }
 
@@ -505,14 +570,14 @@ async function getOrder(req, res, next) {
         let order = rows[0];
         if (!order) return res.status(404).json({ message: "ไม่พบคำสั่งซื้อนี้" });
 
-        // self-heal: ลูกค้าเปิด/poll หน้านี้ตอนออเดอร์ยัง pending และมี charge ผูกอยู่แล้ว → เช็คสถานะจริง
-        // กับ Omise ตรงๆ อีกที เผื่อ webhook มาช้า/ตกหล่น (หรือ dev local ไม่มี public URL ให้ Omise ยิงมาได้
-        // เลย) — น่าเชื่อถือเท่า webhook เพราะเป็น backend ถาม Omise เอง ไม่ใช่เชื่อ client จึงไม่ผิดกฎเหล็ก
+        // self-heal: ลูกค้าเปิด/poll หน้านี้ตอนออเดอร์ยัง pending และมี payment intent ผูกอยู่แล้ว → เช็คสถานะจริง
+        // กับ Stripe ตรงๆ อีกที เผื่อ webhook มาช้า/ตกหล่น (หรือ dev local ไม่มี public URL ให้ Stripe ยิงมาได้
+        // เลย) — น่าเชื่อถือเท่า webhook เพราะเป็น backend ถาม Stripe เอง ไม่ใช่เชื่อ client จึงไม่ผิดกฎเหล็ก
         // ข้อ 1 (ที่ห้ามแค่ "เชื่อว่าลูกค้าจ่ายแล้วเพราะ redirect กลับมา" ไม่ได้ห้าม backend ไปเช็คเอง)
-        if (order.ord_status === "pending" && order.ord_omise_charge_id && omiseClient.isConfigured()) {
-            const liveCharge = await omiseClient.getCharge(order.ord_omise_charge_id);
+        if (order.ord_status === "pending" && order.ord_omise_charge_id && stripeClient.isConfigured()) {
+            const liveIntent = await stripeClient.getPaymentIntent(order.ord_omise_charge_id);
             const expectedSatang = Math.round(Number(order.ord_total) * 100);
-            if (liveCharge?.paid && liveCharge.status === "successful" && liveCharge.amount === expectedSatang) {
+            if (liveIntent?.status === "succeeded" && liveIntent.amount === expectedSatang) {
                 await settlePaidOrder(order.ord_id);
                 order = { ...order, ord_status: "paid" };
             }
@@ -554,6 +619,6 @@ async function getMyEntitlements(req, res, next) {
 
 module.exports = {
     getPublicProducts, getPublicProduct, getPopularProducts, getPublicCategories, getSampleQuestions, getPublicPackages, checkout, confirmPayment,
-    handlePaymentWebhook, getOrder, getMyEntitlements,
-    settlePaidOrder, isPaymentGatewayConfigured: omiseClient.isConfigured,
+    handlePaymentWebhook, getOrder, getMyEntitlements, cancelMyOrder,
+    settlePaidOrder, cancelOrder, isPaymentGatewayConfigured: stripeClient.isConfigured,
 };

@@ -1,5 +1,5 @@
 const pool = require("../config/db");
-const { settlePaidOrder } = require("./store.controller");
+const { settlePaidOrder, cancelOrder } = require("./store.controller");
 
 // รายการคำสั่งซื้อของลูกค้า — ใช้ดูภาพรวม และเป็นช่องทางหา order ที่ค้าง pending สำหรับ fallback
 // ยืนยันจ่ายเงินด้วยมือ (กฎเหล็กข้อ 5 ใน CLAUDE.md: PromptPay ไม่ real-time ต้องมี fallback ให้แอดมิน)
@@ -40,4 +40,16 @@ async function forceConfirm(req, res, next) {
     }
 }
 
-module.exports = { getAll, forceConfirm };
+// แอดมินยกเลิกคำสั่งซื้อที่ยังไม่จ่าย (เช่น ลูกค้าขอยกเลิกทางแชทแต่ตัวเองกดยกเลิกเองไม่ได้แล้ว/ค้างนาน) —
+// เรียก cancelOrder() จุดเดียวกับที่ลูกค้ายกเลิกเอง (cancelMyOrder ใน store.controller.js) ไม่มี logic แยก
+async function cancel(req, res, next) {
+    try {
+        await cancelOrder(req.params.id);
+        res.json({ message: "ยกเลิกคำสั่งซื้อสำเร็จ" });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ message: err.message });
+        next(err);
+    }
+}
+
+module.exports = { getAll, forceConfirm, cancel };

@@ -376,8 +376,9 @@ router.put("/V1/question-reports/:id/resolve", requireAuth, requirePermission("e
 // ด้วยมือใช้สิทธิ์เดียวกับ grant สิทธิ์ลูกค้าแบบ manual เพราะมีผลเท่ากับ grant สิทธิ์ทันทีเหมือนกัน ─────
 router.get("/V1/orders", requireAuth, requirePermission("reportsManagement"), orderController.getAll);
 router.put("/V1/orders/:id/force-confirm", requireAuth, requirePermission("createCustomer"), orderController.forceConfirm);
+router.put("/V1/orders/:id/cancel", requireAuth, requirePermission("createCustomer"), orderController.cancel);
 
-// ─── ตั้งค่า % ค่าธรรมเนียม payment gateway (Omise) — บิตเดียวคุมทั้งดู+แก้ เพราะเป็นค่าเดียว ไม่ใช่
+// ─── ตั้งค่า % ค่าธรรมเนียม payment gateway (Stripe) — บิตเดียวคุมทั้งดู+แก้ เพราะเป็นค่าเดียว ไม่ใช่
 // CRUD resource ─────────────────────────────────────────────────────────────────────────────
 router.get("/V1/settings/payment", requireAuth, requirePermission("paymentSettings"), settingsController.getPaymentSettings);
 router.put("/V1/settings/payment", requireAuth, requirePermission("paymentSettings"), settingsController.updatePaymentSettings);

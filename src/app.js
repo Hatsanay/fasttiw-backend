@@ -12,9 +12,9 @@ const app = express();
 const allowedOrigins = [process.env.FRONTEND_URL, process.env.STORE_URL].filter(Boolean);
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(morgan("dev"));
-// เก็บ raw body ไว้ใน req.rawBody ด้วย — webhook ของ Omise ต้องเอา raw bytes เป๊ะๆ (ไม่ใช่ JSON ที่
-// parse แล้ว) ไปคำนวณ HMAC เทียบกับ signature ที่ส่งมา ถ้าใช้ body ที่ผ่าน JSON.parse/serialize ใหม่
-// การจัดรูปแบบ whitespace อาจต่างจาก raw bytes ต้นฉบับจนคำนวณ signature ไม่ตรงได้
+// เก็บ raw body ไว้ใน req.rawBody ด้วย — webhook ของ Stripe (stripe.webhooks.constructEvent) ต้องเอา raw
+// bytes เป๊ะๆ (ไม่ใช่ JSON ที่ parse แล้ว) ไปคำนวณ signature เทียบกับที่ส่งมา ถ้าใช้ body ที่ผ่าน
+// JSON.parse/serialize ใหม่ การจัดรูปแบบ whitespace อาจต่างจาก raw bytes ต้นฉบับจนตรวจสอบ signature ไม่ผ่าน
 app.use(express.json({
     verify: (req, res, buf) => { req.rawBody = buf; },
 }));

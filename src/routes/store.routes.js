@@ -43,18 +43,19 @@ router.get("/V1/store/news", newsController.getPublished);
 router.get("/V1/store/news/landing", newsController.getLandingNews);
 
 // webhook จาก payment gateway จริง — ไม่ผ่าน requireCustomerAuth (provider ยิงมาเอง ไม่มี customer token)
-// พิสูจน์ตัวตนด้วย signature ภายในแทน (ดูคอมเมนต์ TODO ที่ handlePaymentWebhook)
+// พิสูจน์ตัวตนด้วย signature ภายในแทน (ดูคอมเมนต์ที่ handlePaymentWebhook)
 router.post("/V1/store/webhooks/payment", storeController.handlePaymentWebhook);
 
 // ต้อง login
 router.post("/V1/store/checkout", requireCustomerAuth, storeController.checkout);
-// mock ยืนยันจ่ายเงิน — mount เฉพาะตอน dev/test ที่ยังไม่มีบัญชี Omise จริงเท่านั้น (สองเงื่อนไขพร้อมกัน
-// เหมือน guard ในตัว controller เอง — ไม่มี route นี้เลยด้วยซ้ำถ้ามี OMISE_SECRET_KEY จริงแล้ว ปลอดภัยกว่า
+// mock ยืนยันจ่ายเงิน — mount เฉพาะตอน dev/test ที่ยังไม่มีบัญชี Stripe จริงเท่านั้น (สองเงื่อนไขพร้อมกัน
+// เหมือน guard ในตัว controller เอง — ไม่มี route นี้เลยด้วยซ้ำถ้ามี STRIPE_SECRET_KEY จริงแล้ว ปลอดภัยกว่า
 // พึ่ง guard ชั้นเดียวในฟังก์ชัน)
 if (process.env.ALLOW_MOCK_PAYMENT_CONFIRM === "true" && !storeController.isPaymentGatewayConfigured()) {
     router.post("/V1/store/orders/:id/confirm-payment", requireCustomerAuth, storeController.confirmPayment);
 }
 router.get("/V1/store/orders/:id", requireCustomerAuth, storeController.getOrder);
+router.put("/V1/store/orders/:id/cancel", requireCustomerAuth, storeController.cancelMyOrder);
 router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.getMyEntitlements);
 
 // ทำข้อสอบ
