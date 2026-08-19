@@ -32,7 +32,7 @@ async function getPublicProducts(req, res, next) {
         const whereClause = conditions.join(" AND ");
 
         const [rows] = await pool.query(
-            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_is_free, p.prod_cover_url,
+            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url,
                     p.prod_category_id, c.cat_name AS prod_category_name,
                     (SELECT COUNT(*) FROM tb_questions q WHERE q.ques_product_id = p.prod_id AND q.ques_status = 'active') AS question_count
              FROM tb_products p
@@ -62,7 +62,7 @@ async function getPopularProducts(req, res, next) {
         const limit = Number(req.query.limit) || 12;
 
         const [popular] = await pool.query(
-            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_is_free, p.prod_cover_url,
+            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url,
                     p.prod_category_id, c.cat_name AS prod_category_name,
                     (SELECT COUNT(*) FROM tb_questions q WHERE q.ques_product_id = p.prod_id AND q.ques_status = 'active') AS question_count,
                     COUNT(si.si_id) AS purchase_count
@@ -81,7 +81,7 @@ async function getPopularProducts(req, res, next) {
             const excludeIds = rows.map((r) => r.prod_id);
             const excludeClause = excludeIds.length ? "AND p.prod_id NOT IN (?)" : "";
             const [filler] = await pool.query(
-                `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_is_free, p.prod_cover_url,
+                `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url,
                         p.prod_category_id, c.cat_name AS prod_category_name,
                         (SELECT COUNT(*) FROM tb_questions q WHERE q.ques_product_id = p.prod_id AND q.ques_status = 'active') AS question_count
                  FROM tb_products p
@@ -123,7 +123,7 @@ async function getPublicCategories(req, res, next) {
 async function getPublicProduct(req, res, next) {
     try {
         const [rows] = await pool.query(
-            `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_is_free, p.prod_cover_url,
+            `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url,
                     p.prod_exam_duration_minutes,
                     c.cat_name AS prod_category_name,
                     (SELECT COUNT(*) FROM tb_questions q WHERE q.ques_product_id = p.prod_id AND q.ques_status = 'active') AS question_count

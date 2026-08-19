@@ -31,7 +31,7 @@ async function getAll(req, res, next) {
         const whereClause = conditions.join(" AND ");
 
         const [rows] = await pool.query(
-            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
+            `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
                     p.prod_exam_duration_minutes, p.prod_entitlement_duration_months,
                     p.prod_created_at, p.prod_updated_at,
                     c.cat_name AS prod_category_name
@@ -56,7 +56,7 @@ async function getAll(req, res, next) {
 async function getOne(req, res, next) {
     try {
         const [rows] = await pool.query(
-            `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
+            `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
                     p.prod_category_id, p.prod_commission_staff_id, p.prod_commission_type, p.prod_commission_value,
                     p.prod_exam_duration_minutes, p.prod_entitlement_duration_months,
                     p.prod_created_at, p.prod_updated_at,
@@ -119,10 +119,22 @@ function validatePrice(prod_price) {
     return null;
 }
 
+// ราคาปกติ (compare-at price) — ไม่บังคับ ใช้แค่โชว์ขีดฆ่าคู่กับราคาจริงเพื่อสร้างความรู้สึกลดราคา
+// ไม่กระทบยอดเงินที่เก็บจริงเลย (ดู comment ใน migration) ต้องมากกว่า prod_price เท่านั้น ไม่งั้นขีดฆ่า
+// ไม่มีความหมาย (ราคาปกติต่ำกว่าราคาขายจริงจะดูเหมือน bug ไม่ใช่ส่วนลด)
+function validateComparePrice(prod_compare_price, prod_price) {
+    if (prod_compare_price === undefined || prod_compare_price === null || prod_compare_price === "") return null;
+    const value = Number(prod_compare_price);
+    if (!Number.isFinite(value) || value < 0) return "ราคาปกติต้องเป็นตัวเลขและไม่ติดลบ";
+    const realPrice = Number(prod_price) || 0;
+    if (value <= realPrice) return "ราคาปกติต้องมากกว่าราคาขายจริง ไม่งั้นจะไม่ใช่ส่วนลด";
+    return null;
+}
+
 async function create(req, res, next) {
     try {
         const {
-            prod_name, prod_description, prod_price, prod_is_free, prod_category_id,
+            prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
             prod_exam_duration_minutes, prod_entitlement_duration_months,
         } = req.body;
@@ -136,16 +148,18 @@ async function create(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
+        const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
+        if (comparePriceError) return res.status(400).json({ message: comparePriceError });
 
         const prod_id = await generateId("tb_products", "PRD");
         await pool.query(
             `INSERT INTO tb_products
-                (prod_id, prod_name, prod_description, prod_price, prod_is_free, prod_category_id, prod_created_by_id,
+                (prod_id, prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id, prod_created_by_id,
                  prod_commission_staff_id, prod_commission_type, prod_commission_value, prod_exam_duration_minutes,
                  prod_entitlement_duration_months)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                prod_id, prod_name, prod_description || null, prod_price || 0, !!prod_is_free, prod_category_id || null, req.user.user_id,
+                prod_id, prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, prod_category_id || null, req.user.user_id,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
                 prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null,
             ]
@@ -160,7 +174,7 @@ async function create(req, res, next) {
 async function update(req, res, next) {
     try {
         const {
-            prod_name, prod_description, prod_price, prod_is_free, prod_status, prod_category_id,
+            prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_status, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
             prod_exam_duration_minutes, prod_entitlement_duration_months,
         } = req.body;
@@ -174,17 +188,19 @@ async function update(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
+        const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
+        if (comparePriceError) return res.status(400).json({ message: comparePriceError });
 
         const status = ["draft", "published", "archived"].includes(prod_status) ? prod_status : "draft";
 
         await pool.query(
-            `UPDATE tb_products SET prod_name = ?, prod_description = ?, prod_price = ?, prod_is_free = ?,
+            `UPDATE tb_products SET prod_name = ?, prod_description = ?, prod_price = ?, prod_compare_price = ?, prod_is_free = ?,
                     prod_status = ?, prod_category_id = ?,
                     prod_commission_staff_id = ?, prod_commission_type = ?, prod_commission_value = ?,
                     prod_exam_duration_minutes = ?, prod_entitlement_duration_months = ?
              WHERE prod_id = ?`,
             [
-                prod_name, prod_description || null, prod_price || 0, !!prod_is_free, status, prod_category_id || null,
+                prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, status, prod_category_id || null,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
                 prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null,
                 req.params.id,
