@@ -45,14 +45,15 @@ function buildQuestionPayload(question, choiceOrder, answer, reveal) {
 }
 
 // ดึงคำถาม+ตัวเลือกทั้งหมดของ product (active เท่านั้น) จัดกลุ่มเป็น map ques_id -> { ...question, choices: [] }
-// ใช้เฉพาะตอนต้องรู้ "ทั้งคลังคำถาม" ของ product จริงๆ (สุ่มเลือกชุดคำถามตอนสร้าง attempt ใหม่, สุ่มตัวอย่าง
-// ฟรีก่อนซื้อ) — ถ้าแค่ต้องอ่านคำถามที่ระบุ id ชัดเจนอยู่แล้ว (attempt ที่มีอยู่แล้ว) ให้ใช้ fetchQuestionsByIds
-// แทนเสมอ ไม่งั้น product ที่มีคำถามเยอะ (เช่น หลักพันข้อ) จะโดนดึงคำถาม+ตัวเลือกทั้งหมดมาทิ้งซ้ำๆ ทุกครั้งที่
-// เปิดหน้า/ตอบทีละข้อ ทั้งที่ 1 attempt ใช้จริงแค่ไม่กี่สิบ/ร้อยข้อ
+// ใช้ตอนสร้าง attempt ใหม่เท่านั้น (ต้องรู้ "ทั้งคลังคำถาม" ของ product จริงๆ) — ถ้าแค่ต้องอ่านคำถามที่ระบุ
+// id ชัดเจนอยู่แล้ว (attempt ที่มีอยู่แล้ว) ให้ใช้ fetchQuestionsByIds แทนเสมอ ไม่งั้น product ที่มีคำถามเยอะ
+// (เช่น หลักพันข้อ) จะโดนดึงคำถาม+ตัวเลือกทั้งหมดมาทิ้งซ้ำๆ ทุกครั้งที่เปิดหน้า/ตอบทีละข้อ ทั้งที่ 1 attempt
+// ใช้จริงแค่ไม่กี่สิบ/ร้อยข้อ — ORDER BY ques_order เพราะลำดับข้อตอนทำข้อสอบต้องตรงกับที่แอดมินจัดไว้เป๊ะ
+// (ไม่สลับสุ่มแล้ว — ดู startOrResumeAttempt)
 async function fetchQuestionsWithChoices(productId) {
     const [questions] = await pool.query(
         `SELECT ques_id, ques_text, ques_explanation, ques_image_url FROM tb_questions
-         WHERE ques_product_id = ? AND ques_status = 'active'`,
+         WHERE ques_product_id = ? AND ques_status = 'active' ORDER BY ques_order ASC`,
         [productId]
     );
     return buildQuestionMap(questions);
@@ -84,9 +85,11 @@ async function fetchSampleQuestions(productId, limit) {
 }
 
 async function buildQuestionMap(questions) {
+    // ORDER BY cho_order เพราะลำดับตัวเลือกตอนทำข้อสอบต้องตรงกับที่แอดมินจัดไว้เป๊ะ (ไม่สลับสุ่มแล้ว — ดู
+    // startOrResumeAttempt) — ไม่มี ORDER BY มาก่อนเลย ตอนนั้นไม่มีผลเพราะทุกจุดที่ใช้ map นี้เอาไปสุ่มต่ออยู่ดี
     const [choices] = await pool.query(
         `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url
-         FROM tb_choices WHERE cho_question_id IN (?)`,
+         FROM tb_choices WHERE cho_question_id IN (?) ORDER BY cho_order ASC`,
         [questions.length ? questions.map((q) => q.ques_id) : [""]]
     );
 
@@ -193,7 +196,10 @@ async function startOrResumeAttempt(req, res, next) {
             return res.status(400).json({ message: "ชุดข้อสอบนี้ยังไม่มีคำถาม" });
         }
 
-        const shuffledQuestionIds = shuffle(questionIds);
+        // ลำดับข้อ/ตัวเลือกตอนทำข้อสอบ = ลำดับที่แอดมินจัดไว้เป๊ะ (ques_order/cho_order จาก fetchQuestionsWithChoices/
+        // buildQuestionMap) ไม่สุ่มสลับแล้ว — ยังคง snapshot ไว้ที่ att_question_order/ans_choice_order เหมือนเดิม
+        // (ไม่ใช่แค่เพื่อกันสุ่ม แต่กันแอดมินแก้ไข/เพิ่มลบคำถามระหว่างที่ attempt ยัง in_progress อยู่แล้วชุดคำถาม
+        // เปลี่ยนกลางอากาศ)
         const timeLimitMinutes = mode === "timed" ? productRows[0].prod_exam_duration_minutes : null;
 
         const conn = await pool.getConnection();
@@ -206,14 +212,14 @@ async function startOrResumeAttempt(req, res, next) {
                     (att_id, att_customer_id, att_product_id, att_mode, att_question_order,
                      att_total_questions, att_time_limit_minutes)
                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [att_id, req.customer.cus_id, productId, mode, JSON.stringify(shuffledQuestionIds), questionIds.length, timeLimitMinutes]
+                [att_id, req.customer.cus_id, productId, mode, JSON.stringify(questionIds), questionIds.length, timeLimitMinutes]
             );
 
             // INSERT รวมทีเดียวแทนการวน query ทีละแถว (เดิม 1 คำถาม = 1 round trip ไป DB) — product ที่มี
             // คำถามเยอะ (หลักร้อย/พัน) จะสร้าง attempt ใหม่ช้ามากถ้าต้อง insert ทีละแถวแบบนั้น
             const answerIds = await generateIds("tb_attempt_answers", "ANS", questionIds.length);
             const answerRows = questionIds.map((quesId, i) => {
-                const choiceOrder = shuffle(questionMap[quesId].choices.map((c) => c.cho_id));
+                const choiceOrder = questionMap[quesId].choices.map((c) => c.cho_id);
                 return [answerIds[i], att_id, quesId, JSON.stringify(choiceOrder)];
             });
             if (answerRows.length > 0) {
