@@ -205,4 +205,40 @@ function buildPasswordResetEmail({ customer, resetUrl, expiresMinutes }) {
     };
 }
 
-module.exports = { buildReceiptEmail, buildPasswordResetEmail, renderLayout, thaiDateTime, thaiDate, baht };
+/* ─────────────────────────── รหัส OTP ยืนยันอีเมลตอนสมัคร ─────────────────────────── */
+
+// ส่ง "ตัวเลข 6 หลัก" ไม่ใช่ลิงก์ (ต่างจากอีเมลตั้งรหัสผ่านใหม่) เพราะผู้ใช้กำลังกรอกฟอร์มสมัครค้างอยู่
+// ในอีกแท็บ ถ้าให้กดลิงก์จะเด้งออกจากฟอร์มแล้วข้อมูลที่กรอกไว้หาย — ให้ก๊อปตัวเลขกลับไปกรอกต่อง่ายกว่า
+//
+// จัดรหัสให้ตัวใหญ่ เว้นระยะตัวอักษร และแยกเป็นกล่องของตัวเอง เพราะคนส่วนใหญ่อ่านจากมือถือแล้วพิมพ์ตาม
+function buildRegisterOtpEmail({ code, expiresMinutes }) {
+    const bodyHtml = `
+      <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#8b95a5;margin-bottom:6px;">ยืนยันอีเมล</div>
+      <h1 style="margin:0 0 6px;font-size:23px;font-weight:600;color:${INK};">รหัสยืนยันการสมัครสมาชิก</h1>
+      <p style="margin:0 0 4px;color:${INK_SOFT};">
+        นำรหัสด้านล่างไปกรอกในหน้าสมัครสมาชิกที่เปิดค้างไว้ เพื่อยืนยันว่าอีเมลนี้เป็นของคุณจริง
+      </p>
+
+      <div style="margin:24px 0 8px;padding:20px;background:#f7f9ff;border:1px solid #dbe4fb;border-radius:12px;text-align:center;">
+        <div style="font-size:34px;font-weight:600;letter-spacing:.32em;color:${BRAND_BLUE};font-family:'Courier New',monospace;">${escapeHtml(code)}</div>
+      </div>
+
+      <p style="margin:14px 0 0;color:${INK_SOFT};font-size:13.5px;">
+        รหัสนี้ใช้ได้ครั้งเดียวและหมดอายุใน ${expiresMinutes} นาที ถ้าหมดอายุแล้วกดขอรหัสใหม่ได้จากหน้าสมัครสมาชิก
+      </p>
+      <p style="margin:14px 0 0;padding:14px 16px;background:#fff8ec;border:1px solid #ffe2b8;border-radius:10px;color:${INK_SOFT};font-size:13.5px;">
+        <strong style="color:${INK};">ไม่ได้เป็นคนสมัคร?</strong> ไม่ต้องทำอะไรเลย ไม่มีบัญชีไหนถูกสร้างขึ้นจนกว่าจะมีการกรอกรหัสนี้
+        — และอย่าบอกรหัสนี้กับใครเด็ดขาด
+      </p>`;
+
+    return {
+        subject: `${code} คือรหัสยืนยันการสมัครสมาชิก Fasttiw`,
+        html: renderLayout({
+            title: "รหัสยืนยันการสมัครสมาชิก",
+            preheader: `รหัสยืนยัน ${code} ใช้ได้ ${expiresMinutes} นาที`,
+            bodyHtml,
+        }),
+    };
+}
+
+module.exports = { buildReceiptEmail, buildPasswordResetEmail, buildRegisterOtpEmail, renderLayout, thaiDateTime, thaiDate, baht };

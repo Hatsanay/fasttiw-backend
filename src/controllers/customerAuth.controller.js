@@ -6,16 +6,108 @@ const { signToken } = require("../utils/jwt");
 const { saveAvatarForCustomer } = require("./customer.controller");
 const { createSession, listSessions, revokeSession, revokeSessionByJti, revokeAllSessions } = require("../utils/customerSession");
 const { sendMail } = require("../utils/mailer");
-const { buildPasswordResetEmail } = require("../utils/emailTemplates");
+const { buildPasswordResetEmail, buildRegisterOtpEmail } = require("../utils/emailTemplates");
 
 const RESET_TOKEN_TTL_MINUTES = 60;
 const RESET_MAX_REQUESTS_PER_HOUR = 3; // ต่อ 1 บัญชี — กันคนกดรัวจนเมลของลูกค้าเต็มและกันเปลืองโควตา SMTP
 
+const OTP_TTL_MINUTES = 10;
+const OTP_MAX_REQUESTS_PER_HOUR = 5; // ต่อ 1 อีเมล — เผื่อคนกดขอรหัสใหม่หลายรอบเพราะเมลเข้าช้า
+const OTP_MAX_ATTEMPTS = 5; // กรอกผิดได้กี่ครั้งต่อรหัส 1 ชุด ก่อนต้องขอรหัสใหม่
+
+/* ─────────────────── สมัครสมาชิก: ขอรหัส OTP → ยืนยันอีเมล → สร้างบัญชี ─────────────────── */
+
+// รหัส 6 หลักแบบสุ่มเท่ากันทุกค่า — ใช้ crypto.randomInt ไม่ใช่ Math.random เพราะอันหลังเดาลำดับถัดไปได้
+// ถ้ารู้ค่าก่อนหน้า (ไม่ใช่ CSPRNG) padStart กัน 6 หลักที่ขึ้นต้นด้วย 0 หายไปตอนแปลงเป็นสตริง
+const generateOtp = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+
+// ขอรหัสยืนยันอีเมลก่อนสมัคร — จุดประสงค์คือกันคนกรอกอีเมลผิด/มั่วแล้วสมัครผ่านไปได้ ซึ่งทำให้ลูกค้าคนนั้น
+// ไม่ได้ทั้งใบเสร็จและลิงก์ตั้งรหัสผ่านใหม่ตลอดไปโดยไม่มีใครรู้ตัว
+//
+// ต่างจาก forgot-password ตรงที่ **ตอบตรงๆ ว่าอีเมลนี้ถูกใช้แล้ว** ได้ ไม่ถือว่าเป็นการเปิดเผยข้อมูล
+// เพราะ endpoint สมัครสมาชิกเดิมก็ตอบ 409 แบบเดียวกันอยู่แล้ว (ถ้าปิดบังตรงนี้ ผู้ใช้จะงงว่าทำไมกรอกรหัส
+// ถูกแล้วยังสมัครไม่ได้ กลายเป็นเพิ่มงานแอดมินโดยไม่ได้ความปลอดภัยเพิ่มจริง)
+async function requestRegisterOtp(req, res, next) {
+    try {
+        const cus_email = String(req.body?.cus_email ?? "").trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cus_email)) {
+            return res.status(400).json({ message: "รูปแบบอีเมลไม่ถูกต้อง" });
+        }
+
+        const [existing] = await pool.query("SELECT cus_id FROM tb_customers WHERE cus_email = ?", [cus_email]);
+        if (existing[0]) {
+            return res.status(409).json({ message: "อีเมลนี้ถูกใช้งานแล้ว กรุณาเข้าสู่ระบบหรือใช้อีเมลอื่น" });
+        }
+
+        const [recent] = await pool.query(
+            `SELECT COUNT(*) AS n FROM tb_email_otps
+             WHERE otp_email = ? AND otp_purpose = 'register' AND otp_created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)`,
+            [cus_email]
+        );
+        if (recent[0].n >= OTP_MAX_REQUESTS_PER_HOUR) {
+            return res.status(429).json({ message: "ขอรหัสยืนยันถี่เกินไป กรุณารอสักครู่แล้วลองใหม่" });
+        }
+
+        // ขอรหัสใหม่ = รหัสเก่าที่ยังไม่ได้ใช้เป็นอันใช้ไม่ได้ทันที ให้มีรหัสที่ใช้ได้แค่ชุดล่าสุดชุดเดียว
+        await pool.query(
+            "UPDATE tb_email_otps SET otp_used_at = NOW() WHERE otp_email = ? AND otp_purpose = 'register' AND otp_used_at IS NULL",
+            [cus_email]
+        );
+
+        const code = generateOtp();
+        const otp_id = await generateId("tb_email_otps", "OTP");
+        await pool.query(
+            `INSERT INTO tb_email_otps (otp_id, otp_email, otp_purpose, otp_code_hash, otp_expires_at)
+             VALUES (?, ?, 'register', ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))`,
+            [otp_id, cus_email, hashToken(code), OTP_TTL_MINUTES]
+        );
+
+        const { subject, html } = buildRegisterOtpEmail({ code, expiresMinutes: OTP_TTL_MINUTES });
+        await sendMail({ to: cus_email, subject, html });
+
+        // เก็บกวาดรหัสเก่าที่หมดอายุนานแล้ว (ตารางนี้โตเร็วกว่า tb_password_resets แต่ยังไม่คุ้มตั้ง job แยก)
+        await pool.query("DELETE FROM tb_email_otps WHERE otp_expires_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
+
+        res.json({ message: `ส่งรหัสยืนยันไปที่ ${cus_email} แล้ว รหัสมีอายุ ${OTP_TTL_MINUTES} นาที` });
+    } catch (err) {
+        next(err);
+    }
+}
+
+// ตรวจรหัส OTP ของอีเมลนั้น — คืน row ที่ใช้ได้ ถ้าไม่ผ่านจะโยน error พร้อมข้อความที่ส่งให้ผู้ใช้ได้เลย
+// นับ attempts ทุกครั้งที่กรอกผิด เพื่อไม่ให้ไล่เดา 6 หลักได้ไม่จำกัด (1 ล้านความเป็นไปได้ ถ้าไม่จำกัด
+// จำนวนครั้งก็ยิงจนถูกได้จริงในทางปฏิบัติ)
+async function consumeRegisterOtp(email, code) {
+    const fail = (message) => Object.assign(new Error(message), { status: 400 });
+
+    const [rows] = await pool.query(
+        `SELECT otp_id, otp_code_hash, otp_attempts FROM tb_email_otps
+         WHERE otp_email = ? AND otp_purpose = 'register' AND otp_used_at IS NULL AND otp_expires_at > NOW()
+         ORDER BY otp_created_at DESC LIMIT 1`,
+        [email]
+    );
+    const otp = rows[0];
+    if (!otp) throw fail("รหัสยืนยันหมดอายุหรือยังไม่ได้ขอรหัส กรุณากดขอรหัสใหม่");
+
+    if (otp.otp_attempts >= OTP_MAX_ATTEMPTS) {
+        throw fail("กรอกรหัสผิดหลายครั้งเกินไป กรุณากดขอรหัสใหม่");
+    }
+    if (otp.otp_code_hash !== hashToken(String(code ?? ""))) {
+        await pool.query("UPDATE tb_email_otps SET otp_attempts = otp_attempts + 1 WHERE otp_id = ?", [otp.otp_id]);
+        const left = OTP_MAX_ATTEMPTS - otp.otp_attempts - 1;
+        throw fail(left > 0 ? `รหัสยืนยันไม่ถูกต้อง (เหลือ ${left} ครั้ง)` : "กรอกรหัสผิดหลายครั้งเกินไป กรุณากดขอรหัสใหม่");
+    }
+    return otp.otp_id;
+}
+
 // สมัครสมาชิกเอง (ต่างจาก customer.controller.js create() ที่แอดมินกดสร้างให้ทางแชท) —
 // ลูกค้าตั้งรหัสผ่านเองตั้งแต่แรก จึงไม่ต้อง cus_must_change_password = TRUE เหมือนฝั่งแอดมินสร้างให้
+//
+// **บังคับต้องมี OTP ที่ยืนยันอีเมลแล้วเสมอ** — เช็คที่นี่ไม่ใช่แค่ที่หน้าเว็บ ไม่งั้นใครยิง API ตรงๆ
+// ก็ข้ามการยืนยันอีเมลได้หมด (การเช็คฝั่ง frontend อย่างเดียวไม่ใช่การป้องกัน)
 async function register(req, res, next) {
     try {
-        const { cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone, pdpa_consent } = req.body ?? {};
+        const { cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone, pdpa_consent, otp } = req.body ?? {};
 
         if (!cus_username || !cus_email || !cus_password) {
             return res.status(400).json({ message: "กรุณากรอกชื่อผู้ใช้ อีเมล และรหัสผ่าน" });
@@ -26,6 +118,12 @@ async function register(req, res, next) {
         if (!pdpa_consent) {
             return res.status(400).json({ message: "กรุณายอมรับนโยบายความเป็นส่วนตัวก่อนสมัครสมาชิก" });
         }
+        if (!otp) {
+            return res.status(400).json({ message: "กรุณากรอกรหัสยืนยันที่ส่งไปทางอีเมล" });
+        }
+
+        const email = String(cus_email).trim();
+        const otpId = await consumeRegisterOtp(email, otp);
 
         const cus_id = await generateId("tb_customers", "CUS");
         const passwordHash = await bcrypt.hash(cus_password, 10);
@@ -35,14 +133,19 @@ async function register(req, res, next) {
                 (cus_id, cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone,
                  cus_must_change_password, cus_pdpa_consented_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, NOW())`,
-            [cus_id, cus_username, cus_email, passwordHash, cus_fname || null, cus_lname || null, cus_phone || null]
+            [cus_id, cus_username, email, passwordHash, cus_fname || null, cus_lname || null, cus_phone || null]
         );
+
+        // ตัดรหัสทิ้งหลังสร้างบัญชีสำเร็จเท่านั้น — ถ้าสร้างไม่ผ่าน (เช่นชื่อผู้ใช้ซ้ำ) รหัสเดิมยังใช้ได้อยู่
+        // ผู้ใช้จะได้แค่แก้ชื่อผู้ใช้แล้วกดสมัครใหม่ ไม่ต้องไปขอรหัสใหม่ทางอีเมลอีกรอบ
+        await pool.query("UPDATE tb_email_otps SET otp_used_at = NOW() WHERE otp_id = ?", [otpId]);
 
         // สมัครเองไม่ต้องผ่านขั้นตอนเปลี่ยนรหัส/เติมข้อมูลบังคับ (mcp = false ตั้งแต่แรก)
         const jti = await createSession(cus_id, req.headers["user-agent"]);
         const token = signToken({ cus_id, mcp: false, jti });
         res.status(201).json({ token });
     } catch (err) {
+        if (err.status) return res.status(err.status).json({ message: err.message });
         if (err.code === "ER_DUP_ENTRY") {
             return res.status(409).json({ message: "ชื่อผู้ใช้หรืออีเมลนี้ถูกใช้งานแล้ว" });
         }
@@ -333,5 +436,5 @@ async function logout(req, res, next) {
 
 module.exports = {
     register, login, getMe, completeOnboarding, updateMyProfile, changeMyPassword, uploadMyImage,
-    getMySessions, deleteMySession, logout, forgotPassword, resetPassword,
+    getMySessions, deleteMySession, logout, forgotPassword, resetPassword, requestRegisterOtp,
 };

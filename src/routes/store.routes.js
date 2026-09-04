@@ -39,6 +39,13 @@ const resetLimiter = rateLimit({
     message: "ทำรายการถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
 });
 
+// ขอรหัส OTP ยืนยันอีเมลก่อนสมัคร — จำกัด IP เข้มกว่า register เพราะทุกครั้งที่เรียกคือการส่งอีเมลจริง
+// (เปลืองโควตา SMTP + อาจกลายเป็นเครื่องยิงสแปมใส่คนอื่น) ส่วนลิมิตรายอีเมล 5 ครั้ง/ชม. อยู่ใน controller
+const registerOtpLimiter = rateLimit({
+    name: "register-otp", windowMs: 60 * 60 * 1000, max: 8,
+    message: "ขอรหัสยืนยันถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+router.post("/V1/store/auth/register/request-otp", registerOtpLimiter, customerAuthController.requestRegisterOtp);
 router.post("/V1/store/auth/register", registerLimiter, customerAuthController.register);
 router.post("/V1/store/auth/login", loginLimiter, customerAuthController.login);
 router.post("/V1/store/auth/logout", requireCustomerAuth, customerAuthController.logout);
