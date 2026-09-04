@@ -6,6 +6,8 @@ const { fetchSampleQuestions, buildQuestionPayload } = require("./attempt.contro
 const stripeClient = require("../utils/stripeClient");
 const settingsController = require("./settings.controller");
 const { getEffectivePrice } = require("../utils/pricing");
+const { sendMail } = require("../utils/mailer");
+const { buildReceiptEmail } = require("../utils/emailTemplates");
 
 // Stripe ไม่มี field วันหมดอายุ QR ของ PromptPay ให้เหมือน Omise (ตรวจสอบแล้วจาก docs.stripe.com — ไม่มี
 // payment_method_options[promptpay][expires_after_seconds] แบบที่ Pix มี และ next_action.promptpay_display_qr_code
@@ -347,7 +349,9 @@ async function checkout(req, res, next) {
 // grantOrRenewProduct/incrementUsage/recordSale ให้รับ transaction connection เพิ่ม
 async function settlePaidOrder(orderId) {
     const [rows] = await pool.query(
-        "SELECT ord_id, ord_customer_id, ord_coupon_id, ord_package_id, ord_total, ord_discount, ord_omise_charge_id FROM tb_orders WHERE ord_id = ?",
+        `SELECT ord_id, ord_customer_id, ord_coupon_id, ord_package_id, ord_subtotal, ord_total, ord_discount,
+                ord_omise_charge_id
+         FROM tb_orders WHERE ord_id = ?`,
         [orderId]
     );
     const order = rows[0];
@@ -368,8 +372,9 @@ async function settlePaidOrder(orderId) {
     // join ดึง prod_entitlement_duration_months มาด้วย — ตั้งได้แยกรายชุดข้อสอบ (NULL = lifetime) เพื่อส่ง
     // เป็น durationMonths ให้ grantOrRenewProduct() แทนค่า null ตายตัวแบบเดิม (เดิม grant ฝั่งลูกค้าซื้อเอง
     // เป็น lifetime เสมอไม่ว่า product ไหน) — ไม่กระทบสิทธิ์เดิมที่ลูกค้าถืออยู่แล้วก่อนหน้านี้เลย
+    // ดึง prod_name/oi_total มาด้วยเพื่อใช้ในใบเสร็จที่ส่งอีเมลท้ายฟังก์ชัน (query เดิมอยู่แล้ว ไม่ได้ยิงเพิ่ม)
     const [items] = await pool.query(
-        `SELECT oi.oi_product_id, p.prod_entitlement_duration_months
+        `SELECT oi.oi_product_id, oi.oi_price, oi.oi_total, p.prod_name, p.prod_entitlement_duration_months
          FROM tb_order_items oi
          JOIN tb_products p ON p.prod_id = oi.oi_product_id
          WHERE oi.oi_order_id = ?`,
@@ -383,8 +388,10 @@ async function settlePaidOrder(orderId) {
         coupon = couponRows[0] ?? null;
     }
 
+    const entitlementIds = [];
     for (const item of items) {
-        await grantOrRenewProduct(order.ord_customer_id, item.oi_product_id, null, item.prod_entitlement_duration_months, "payment");
+        const entId = await grantOrRenewProduct(order.ord_customer_id, item.oi_product_id, null, item.prod_entitlement_duration_months, "payment");
+        if (entId) entitlementIds.push(entId);
     }
     if (coupon) await incrementUsage(coupon.cpn_id);
 
@@ -400,7 +407,53 @@ async function settlePaidOrder(orderId) {
     // ไม่มี ord_coupon_id เลย (เป็น NULL) ถ้าไม่ส่ง override ไป ส่วนลดแพ็กเกจจะหายไปเงียบๆ ตอนบันทึกยอดขาย
     await recordSale(order.ord_customer_id, productIds, coupon, null, gatewayFee, Number(order.ord_discount), order.ord_package_id);
 
+    await sendReceiptEmail(order, items, entitlementIds);
+
     return { alreadySettled: false };
+}
+
+// ส่งใบเสร็จให้ลูกค้าหลัง settle สำเร็จ — อยู่หลัง claim แบบ atomic ของ settlePaidOrder เสมอ จึงส่งได้
+// ครั้งเดียวต่อออเดอร์โดยอัตโนมัติ ไม่ว่า webhook จะยิงซ้ำกี่รอบ (ยิงซ้ำจะ return ที่ alreadySettled ไปก่อน
+// ถึงบรรทัดนี้) — ครอบ try/catch ทั้งก้อนเพราะ **ห้ามให้การส่งอีเมลทำให้การให้สิทธิ์ล้ม** ลูกค้าจ่ายเงินแล้ว
+// ต้องได้ของเสมอ ต่อให้ SMTP ล่มหรือยังไม่ได้ตั้งค่าก็ตาม (sendMail เองก็ไม่ throw อยู่แล้ว แต่ query
+// ดึงข้อมูลลูกค้า/สิทธิ์ที่นี่ throw ได้)
+async function sendReceiptEmail(order, items, entitlementIds) {
+    try {
+        const [customerRows] = await pool.query(
+            "SELECT cus_email, cus_fname, cus_lname, cus_username FROM tb_customers WHERE cus_id = ?",
+            [order.ord_customer_id]
+        );
+        const customer = customerRows[0];
+        if (!customer?.cus_email) {
+            console.warn(`[receipt] ออเดอร์ ${order.ord_id}: ลูกค้าไม่มีอีเมลในระบบ ข้ามการส่งใบเสร็จ`);
+            return;
+        }
+
+        // อ่านวันหมดอายุจริงหลัง grant/ต่ออายุเสร็จแล้ว (ไม่คำนวณซ้ำเองที่นี่) เพื่อให้เลขในใบเสร็จตรงกับ
+        // สิทธิ์จริงใน DB เสมอ รวมถึงเคสซื้อซ้ำที่เป็นการ "ต่ออายุ" จากวันหมดอายุเดิม ไม่ใช่นับใหม่จากวันนี้
+        let entitlements = [];
+        if (entitlementIds.length) {
+            const [entRows] = await pool.query(
+                `SELECT e.ent_expires_at, p.prod_name
+                 FROM tb_entitlements e JOIN tb_products p ON p.prod_id = e.ent_product_id
+                 WHERE e.ent_id IN (?)`,
+                [entitlementIds]
+            );
+            entitlements = entRows;
+        }
+
+        // ord_paid_at เพิ่งถูกตั้งเป็น NOW() ใน UPDATE ด้านบน แต่ order object ในหน่วยความจำยังเป็นค่าก่อนหน้า
+        // (NULL) — ส่งเวลาปัจจุบันเข้าไปแทน ตรงกับที่บันทึกลง DB ในวินาทีเดียวกัน
+        const { subject, html } = buildReceiptEmail({
+            order: { ...order, ord_paid_at: new Date() },
+            items,
+            customer,
+            entitlements,
+        });
+        await sendMail({ to: customer.cus_email, subject, html });
+    } catch (err) {
+        console.error(`[receipt] ส่งใบเสร็จออเดอร์ ${order.ord_id} ไม่สำเร็จ:`, err.message);
+    }
 }
 
 // ─── cancelOrder — logic กลางที่ "ยกเลิกคำสั่งซื้อที่ยังไม่จ่าย" ต้องเรียกจุดเดียว เหมือน settlePaidOrder
@@ -559,6 +612,49 @@ async function handlePaymentWebhook(req, res, next) {
     }
 }
 
+// รายการคำสั่งซื้อทั้งหมดของลูกค้าคนที่ login อยู่ — เดิมมีแต่ getOrder รายใบ ลูกค้าที่ปิดแท็บทิ้งไปแล้ว
+// หาออเดอร์ตัวเองไม่เจอเลยถ้าไม่มีลิงก์เก็บไว้
+//
+// ดึงชื่อชุดข้อสอบมาด้วยแบบ query เดียว (GROUP_CONCAT) ไม่ยิงรายออเดอร์วนลูป — หน้าลิสต์อยากโชว์ว่า
+// ออเดอร์นั้นซื้ออะไรบ้างโดยไม่ต้องกดเข้าไปดูทีละใบ ถ้ายิงทีละใบจะกลายเป็น N+1 query ทันทีที่ลูกค้ามี
+// ประวัติเยอะ (ORDER BY oi_id ให้ลำดับชื่อคงที่ทุกครั้งที่โหลด ไม่สลับไปมา)
+async function getMyOrders(req, res, next) {
+    try {
+        const limit = Math.min(Number(req.query.limit) || 20, 100);
+        const offset = Number(req.query.offset) || 0;
+
+        const [rows] = await pool.query(
+            `SELECT o.ord_id, o.ord_subtotal, o.ord_discount, o.ord_total, o.ord_status,
+                    o.ord_paid_at, o.ord_created_at, o.ord_qr_expires_at,
+                    COUNT(oi.oi_id) AS item_count,
+                    GROUP_CONCAT(p.prod_name ORDER BY oi.oi_id SEPARATOR ' | ') AS product_names
+             FROM tb_orders o
+             LEFT JOIN tb_order_items oi ON oi.oi_order_id = o.ord_id
+             LEFT JOIN tb_products p ON p.prod_id = oi.oi_product_id
+             WHERE o.ord_customer_id = ?
+             GROUP BY o.ord_id
+             ORDER BY o.ord_created_at DESC
+             LIMIT ? OFFSET ?`,
+            [req.customer.cus_id, limit, offset]
+        );
+
+        const [countRows] = await pool.query(
+            "SELECT COUNT(*) AS total FROM tb_orders WHERE ord_customer_id = ?",
+            [req.customer.cus_id]
+        );
+
+        const data = rows.map((row) => ({
+            ...row,
+            item_count: Number(row.item_count),
+            product_names: row.product_names ? row.product_names.split(" | ") : [],
+        }));
+
+        res.json({ data, total: countRows[0].total });
+    } catch (err) {
+        next(err);
+    }
+}
+
 async function getOrder(req, res, next) {
     try {
         const [rows] = await pool.query(
@@ -619,6 +715,6 @@ async function getMyEntitlements(req, res, next) {
 
 module.exports = {
     getPublicProducts, getPublicProduct, getPopularProducts, getPublicCategories, getSampleQuestions, getPublicPackages, checkout, confirmPayment,
-    handlePaymentWebhook, getOrder, getMyEntitlements, cancelMyOrder,
+    handlePaymentWebhook, getOrder, getMyOrders, getMyEntitlements, cancelMyOrder,
     settlePaidOrder, cancelOrder, isPaymentGatewayConfigured: stripeClient.isConfigured,
 };

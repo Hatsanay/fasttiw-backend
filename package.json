@@ -5,7 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "mail:test": "node scripts/send-test-email.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -17,6 +18,7 @@
     "morgan": "^1.10.0",
     "multer": "^2.0.0",
     "mysql2": "^3.11.0",
+    "nodemailer": "^10.0.0",
     "sharp": "^0.35.3",
     "stripe": "^22.5.0"
   }

@@ -56,4 +56,11 @@ async function revokeSessionByJti(customerId, jti) {
     );
 }
 
-module.exports = { createSession, sessionExists, listSessions, revokeSession, revokeSessionByJti, MAX_ACTIVE_SESSIONS };
+// เตะทุกอุปกรณ์ของลูกค้าคนนี้ออกพร้อมกัน — ใช้ตอนตั้งรหัสผ่านใหม่ผ่านลิงก์ในอีเมล เพราะเหตุผลที่ลูกค้า
+// กดลืมรหัสผ่านอาจเป็นเพราะบัญชีถูกคนอื่นเข้าถึงอยู่ ถ้าไม่เตะออก คนที่ล็อกอินค้างอยู่ก็ยังใช้ต่อได้เรื่อยๆ
+// ทั้งที่เจ้าของเพิ่งเปลี่ยนรหัสผ่านไปแล้ว
+async function revokeAllSessions(customerId) {
+    await pool.query("DELETE FROM tb_customer_sessions WHERE sess_customer_id = ?", [customerId]);
+}
+
+module.exports = { createSession, sessionExists, listSessions, revokeSession, revokeSessionByJti, revokeAllSessions, MAX_ACTIVE_SESSIONS };

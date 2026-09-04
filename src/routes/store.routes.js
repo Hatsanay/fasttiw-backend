@@ -18,6 +18,10 @@ const router = express.Router();
 router.post("/V1/store/auth/register", customerAuthController.register);
 router.post("/V1/store/auth/login", customerAuthController.login);
 router.post("/V1/store/auth/logout", requireCustomerAuth, customerAuthController.logout);
+// ลืมรหัสผ่าน — ไม่ต้อง auth (คนที่เข้าระบบไม่ได้อยู่แล้วเป็นคนเรียก) ทั้งคู่ป้องกันการยิงรัวด้วยตัวเอง:
+// forgot-password จำกัด 3 ครั้ง/ชั่วโมง/บัญชี ส่วน reset-password ใช้ token ที่เดาไม่ได้และใช้ได้ครั้งเดียว
+router.post("/V1/store/auth/forgot-password", customerAuthController.forgotPassword);
+router.post("/V1/store/auth/reset-password", customerAuthController.resetPassword);
 router.get("/V1/store/me", requireCustomerAuth, customerAuthController.getMe);
 router.put("/V1/store/me", requireCustomerAuth, customerAuthController.updateMyProfile);
 router.put("/V1/store/me/password", requireCustomerAuth, customerAuthController.changeMyPassword);
@@ -54,6 +58,8 @@ router.post("/V1/store/checkout", requireCustomerAuth, storeController.checkout)
 if (process.env.ALLOW_MOCK_PAYMENT_CONFIRM === "true" && !storeController.isPaymentGatewayConfigured()) {
     router.post("/V1/store/orders/:id/confirm-payment", requireCustomerAuth, storeController.confirmPayment);
 }
+// ต้องอยู่ก่อน /orders/:id — ถ้าวางทีหลัง express จะจับคำว่า "orders" เป็นค่า :id แล้วไม่มีทางเข้าถึง route นี้เลย
+router.get("/V1/store/orders", requireCustomerAuth, storeController.getMyOrders);
 router.get("/V1/store/orders/:id", requireCustomerAuth, storeController.getOrder);
 router.put("/V1/store/orders/:id/cancel", requireCustomerAuth, storeController.cancelMyOrder);
 router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.getMyEntitlements);
