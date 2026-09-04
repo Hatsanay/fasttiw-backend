@@ -10,18 +10,42 @@ const chatController = require("../controllers/chat.controller");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
 const { uploadImage } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
+const { rateLimit } = require("../middlewares/rateLimit.middleware");
 
 // เส้นทางทั้งหมดของฝั่งลูกค้า (storefront + ทำข้อสอบ) แยกจาก route staff เดิมทั้งหมด —
 // ใช้ requireCustomerAuth (token payload { cus_id }) แทน requireAuth/requirePermission ของฝั่งแอดมิน
 const router = express.Router();
 
-router.post("/V1/store/auth/register", customerAuthController.register);
-router.post("/V1/store/auth/login", customerAuthController.login);
+// ─── endpoint สาธารณะที่ยิงรัวได้โดยไม่ต้อง login → จำกัดจำนวนครั้งต่อ IP ทุกตัว ────────────────
+// ตัวเลขตั้งให้ "หลวมพอสำหรับคนใช้จริงที่พิมพ์ผิดหลายรอบ แต่แน่นพอที่จะทำให้การไล่ยิงอัตโนมัติไม่คุ้ม"
+// — ลิมิตรายบัญชีที่มีอยู่แล้ว (forgot-password 3 ครั้ง/ชม./บัญชี) ยังทำงานคู่กันไป คนละมิติกัน:
+// อันนั้นกันสแปมกล่องเมลของเหยื่อ ส่วนอันนี้กันคนกวาดยิงหลายบัญชีจากเครื่องเดียว
+const loginLimiter = rateLimit({
+    name: "login", windowMs: 15 * 60 * 1000, max: 20,
+    message: "พยายามเข้าสู่ระบบถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+const registerLimiter = rateLimit({
+    name: "register", windowMs: 60 * 60 * 1000, max: 10,
+    message: "สมัครสมาชิกถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+const forgotLimiter = rateLimit({
+    name: "forgot", windowMs: 60 * 60 * 1000, max: 10,
+    message: "ขอลิงก์ตั้งรหัสผ่านใหม่ถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+// เผื่อคนกดผิด/ลิงก์หมดอายุแล้วขอใหม่หลายรอบ แต่ยังตัดการไล่เดา token ทิ้ง (token สุ่ม 256 บิต
+// ต่อให้ยิงได้ 30 ครั้ง/ชม. ก็ไม่มีทางเดาถูกอยู่แล้ว — ลิมิตนี้กันการเปลือง query มากกว่ากันเดาสำเร็จ)
+const resetLimiter = rateLimit({
+    name: "reset", windowMs: 60 * 60 * 1000, max: 30,
+    message: "ทำรายการถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+
+router.post("/V1/store/auth/register", registerLimiter, customerAuthController.register);
+router.post("/V1/store/auth/login", loginLimiter, customerAuthController.login);
 router.post("/V1/store/auth/logout", requireCustomerAuth, customerAuthController.logout);
-// ลืมรหัสผ่าน — ไม่ต้อง auth (คนที่เข้าระบบไม่ได้อยู่แล้วเป็นคนเรียก) ทั้งคู่ป้องกันการยิงรัวด้วยตัวเอง:
-// forgot-password จำกัด 3 ครั้ง/ชั่วโมง/บัญชี ส่วน reset-password ใช้ token ที่เดาไม่ได้และใช้ได้ครั้งเดียว
-router.post("/V1/store/auth/forgot-password", customerAuthController.forgotPassword);
-router.post("/V1/store/auth/reset-password", customerAuthController.resetPassword);
+// ลืมรหัสผ่าน — ไม่ต้อง auth (คนที่เข้าระบบไม่ได้อยู่แล้วเป็นคนเรียก) ป้องกันหลายชั้น: จำกัดต่อ IP ที่นี่,
+// จำกัด 3 ครั้ง/ชม./บัญชีใน controller, token ใช้ได้ครั้งเดียวและหมดอายุใน 60 นาที
+router.post("/V1/store/auth/forgot-password", forgotLimiter, customerAuthController.forgotPassword);
+router.post("/V1/store/auth/reset-password", resetLimiter, customerAuthController.resetPassword);
 router.get("/V1/store/me", requireCustomerAuth, customerAuthController.getMe);
 router.put("/V1/store/me", requireCustomerAuth, customerAuthController.updateMyProfile);
 router.put("/V1/store/me/password", requireCustomerAuth, customerAuthController.changeMyPassword);
