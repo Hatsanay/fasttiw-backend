@@ -76,6 +76,30 @@ async function cancelPaymentIntent(paymentIntentId) {
     }
 }
 
+// คืนเงินบางส่วน/ทั้งหมดของ PaymentIntent — ใช้ตอนแอดมินกดคืนเงินให้ลูกค้าที่ซื้อผ่านเว็บ
+//
+// amountSatang: ระบุได้เพื่อคืนเฉพาะบางรายการในบิล (Stripe รองรับ partial refund) ไม่ส่ง = คืนเต็มจำนวน
+//
+// **ค่าธรรมเนียมที่ Stripe หักไปตอนรับเงิน จะไม่ถูกคืนกลับมาพร้อมกัน** (นโยบายของ Stripe เอง) ฉะนั้นการคืนเงิน
+// ทุกครั้งธุรกิจจะขาดทุนเท่าค่าธรรมเนียมก้อนนั้นเสมอ ชั้นเรียกใช้ต้องบันทึกส่วนนี้ให้ตรงเอง ไม่ใช่ทำเหมือน
+// ไม่เคยเกิดอะไรขึ้น
+//
+// ไม่ swallow error เหมือน cancelPaymentIntent เพราะการคืนเงินเป็นการเคลื่อนไหวเงินจริง ถ้าล้มต้องรู้ทันที
+// และต้องไม่บันทึกรายการกลับในระบบเรา (ไม่งั้นตัวเลขจะบอกว่าคืนแล้วทั้งที่เงินยังไม่ออก)
+async function refundPaymentIntent(paymentIntentId, { amountSatang, reason } = {}) {
+    const stripe = getClient();
+    if (!stripe) {
+        const err = new Error("ยังไม่ได้ตั้งค่า STRIPE_SECRET_KEY");
+        err.code = "STRIPE_NOT_CONFIGURED";
+        throw err;
+    }
+    return stripe.refunds.create({
+        payment_intent: paymentIntentId,
+        ...(amountSatang ? { amount: amountSatang } : {}),
+        ...(reason ? { reason } : {}),
+    });
+}
+
 // verify + parse webhook payload ในฟังก์ชันเดียว (stripe.webhooks.constructEvent throw เองถ้า signature ผิด
 // ผู้เรียกต้อง try/catch) — ใช้ SDK แทนเขียน HMAC เองเพราะมี timestamp tolerance กัน replay attack ในตัว
 function constructWebhookEvent(rawBody, signatureHeader) {
@@ -88,4 +112,4 @@ function constructWebhookEvent(rawBody, signatureHeader) {
     return stripe.webhooks.constructEvent(rawBody, signatureHeader, process.env.STRIPE_WEBHOOK_SECRET);
 }
 
-module.exports = { isConfigured, createPromptPayIntent, getPaymentIntent, cancelPaymentIntent, constructWebhookEvent };
+module.exports = { isConfigured, createPromptPayIntent, getPaymentIntent, cancelPaymentIntent, refundPaymentIntent, constructWebhookEvent };

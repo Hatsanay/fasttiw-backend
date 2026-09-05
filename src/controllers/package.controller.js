@@ -20,8 +20,15 @@ async function getAll(req, res, next) {
         const whereClause = conditions.join(" AND ");
 
         const [rows] = await pool.query(
+            // individual_total = ราคารวมถ้าซื้อชุดข้อสอบข้างในแยกทีละชิ้น — ใช้โชว์ "ประหยัดเท่าไร" และคำนวณ
+            // ส่วนลดแพ็กเกจในหน้าให้สิทธิ์ฝั่งแอดมิน (GrantProductsModal) เงื่อนไข prod_is_free ต้องตรงกับ
+            // getEffectivePrice() ใน utils/pricing.js เป๊ะ — ชุดที่แจกฟรีนับเป็น 0 ไม่ว่า prod_price จะตั้งไว้เท่าไร
             `SELECT pkg_id, pkg_name, pkg_price, pkg_cover_url, pkg_status, pkg_created_at, pkg_updated_at,
-                    (SELECT COUNT(*) FROM tb_package_items pi WHERE pi.pki_package_id = tb_packages.pkg_id) AS product_count
+                    (SELECT COUNT(*) FROM tb_package_items pi WHERE pi.pki_package_id = tb_packages.pkg_id) AS product_count,
+                    (SELECT COALESCE(SUM(CASE WHEN p.prod_is_free THEN 0 ELSE p.prod_price END), 0)
+                       FROM tb_package_items pi
+                       JOIN tb_products p ON p.prod_id = pi.pki_product_id
+                      WHERE pi.pki_package_id = tb_packages.pkg_id) AS individual_total
              FROM tb_packages
              WHERE ${whereClause}
              ORDER BY pkg_id DESC

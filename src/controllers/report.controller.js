@@ -363,6 +363,65 @@ async function getPackageRanking(req, res, next) {
     }
 }
 
+// แยกยอดขายตาม "ช่องทาง" — แอดมินขายผ่านแชทแล้ว grant มือ vs ลูกค้ากดซื้อเองบนเว็บ
+//
+// ตัดสินจาก tb_sales.sale_created_by_id: มีค่า = staff คนนั้นเป็นคนกดให้สิทธิ์ (ดู createBatch ใน
+// entitlement.controller.js ส่ง req.user.user_id เข้ามา), NULL = มาจาก settlePaidOrder ที่ webhook เรียก
+// ซึ่งไม่มี user คนไหนกดเลย — ไม่ต้องเพิ่มคอลัมน์ใหม่ ข้อมูลนี้ถูกบันทึกไว้ตั้งแต่แรกแล้ว แค่ไม่เคยมีใครหยิบมาใช้
+//
+// ประโยชน์: ตอบคำถามว่าช่องทางไหนทำเงินได้มากกว่ากัน คุ้มไหมที่จะลงแรงกับ payment gateway ต่อ หรือควร
+// ทุ่มไปทางขายผ่านแชท (ตาม CLAUDE.md ข้อ 3 ที่ตั้งใจเริ่มจากช่องทางแชทก่อนเพื่อพิสูจน์ยอดขายจริง)
+async function getSalesByChannel(req, res, next) {
+    try {
+        const { from, to } = req.query;
+        const conditions = [];
+        const params = [];
+        if (from) { conditions.push("sale_created_at >= ?"); params.push(`${from} 00:00:00`); }
+        if (to) { conditions.push("sale_created_at <= ?"); params.push(`${to} 23:59:59`); }
+        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+        const [[row]] = await pool.query(
+            `SELECT
+                COALESCE(SUM(CASE WHEN sale_created_by_id IS NOT NULL THEN sale_total ELSE 0 END), 0) AS admin_revenue,
+                SUM(sale_created_by_id IS NOT NULL) AS admin_count,
+                COALESCE(SUM(CASE WHEN sale_created_by_id IS NULL THEN sale_total ELSE 0 END), 0) AS self_revenue,
+                SUM(sale_created_by_id IS NULL) AS self_count,
+                COALESCE(SUM(sale_gateway_fee), 0) AS gateway_fee
+             FROM tb_sales ${whereClause}`,
+            params
+        );
+
+        const adminRevenue = Number(row.admin_revenue);
+        const selfRevenue = Number(row.self_revenue);
+        const totalRevenue = adminRevenue + selfRevenue;
+
+        res.json({
+            total_revenue: totalRevenue,
+            // ค่าธรรมเนียม gateway เกิดเฉพาะช่องทางซื้อเอง (grant มือส่ง gatewayFee = 0 เสมอ) แนบมาด้วยเพื่อให้
+            // เทียบกันได้ว่าช่องทางเว็บเหลือเข้ากระเป๋าจริงเท่าไรหลังหักค่าธรรมเนียม
+            gateway_fee: Number(row.gateway_fee),
+            channels: [
+                {
+                    key: "admin",
+                    label: "แอดมินให้สิทธิ์เอง",
+                    revenue: adminRevenue,
+                    sale_count: Number(row.admin_count),
+                    share: totalRevenue > 0 ? Math.round((adminRevenue / totalRevenue) * 100) : 0,
+                },
+                {
+                    key: "self",
+                    label: "ลูกค้าซื้อเองบนเว็บ",
+                    revenue: selfRevenue,
+                    sale_count: Number(row.self_count),
+                    share: totalRevenue > 0 ? Math.round((selfRevenue / totalRevenue) * 100) : 0,
+                },
+            ],
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
 // อัตราแปลงจาก "เคยใช้สิทธิ์ฟรี" → "กลับมาซื้อแบบจ่ายเงินจริง" — free_claimer_count กรองตามช่วงเวลาที่เลือก
 // (คนที่ใช้สิทธิ์ฟรีอย่างน้อย 1 ครั้งภายในช่วงนี้ ไม่จำเป็นต้องเป็นครั้งแรกที่เคยใช้สิทธิ์ฟรีเลยตลอดประวัติ — คนที่
 // เคยใช้ฟรีมาก่อนหน้าช่วงนี้แล้วมาใช้ฟรีอีกครั้งในช่วงนี้ก็นับ) ส่วน converted_count เช็คการซื้อแบบจ่ายเงินของคนกลุ่มนั้น "ตลอดเวลา"
@@ -509,4 +568,5 @@ module.exports = {
     summary, byProduct, partnerShare, getRetainedEarnings,
     computeNetProfit, computeRetainedEarnings, calculateDividendAmount,
     getProductRanking, getPackageRanking, getFreeToPaidConversion, getDailySalesTrend, getTopCategories,
+    getSalesByChannel,
 };

@@ -1,7 +1,7 @@
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { findValidCoupon, incrementUsage } = require("./coupon.controller");
-const { grantOrRenewProduct, calculateDiscount, recordSale } = require("./entitlement.controller");
+const { grantOrRenewProduct, calculateDiscount, recordSale, linkEntitlementsToSale, snapshotExpiries } = require("./entitlement.controller");
 const { fetchSampleQuestions, buildQuestionPayload } = require("./attempt.controller");
 const stripeClient = require("../utils/stripeClient");
 const settingsController = require("./settings.controller");
@@ -259,7 +259,11 @@ async function checkout(req, res, next) {
         let coupon = null;
         let discount = 0;
         if (pkg) {
-            discount = Math.max(0, subtotal - Number(pkg.pkg_price));
+            // ไม่ครอบ Math.max(0, ...) โดยตั้งใจ — ถ้าราคาแพ็กเกจสูงกว่าราคารวมถ้าซื้อแยก ส่วนลดจะติดลบ
+            // (= ค่าเพิ่ม) แล้ว total ออกมาเท่า pkg_price พอดี ราคาที่แอดมินตั้งไว้เป็นตัวชี้ขาดเสมอ
+            // ก่อนหน้านี้ครอบ max(0) ไว้ ทำให้แพ็กเกจที่ตั้งราคาสูงกว่าผลรวมถูกเรียกเก็บเงินตามผลรวม
+            // (น้อยกว่าราคาที่ตั้งไว้) เงียบๆ ทั้งที่แอดมินตั้งใจตั้งราคานั้น
+            discount = subtotal - Number(pkg.pkg_price);
         } else if (coupon_code) {
             const result = await findValidCoupon(coupon_code);
             if (!result.coupon) return res.status(400).json({ message: result.error });
@@ -389,10 +393,17 @@ async function settlePaidOrder(orderId) {
         coupon = couponRows[0] ?? null;
     }
 
+    // อ่านวันหมดอายุเดิมก่อนแตะสิทธิ์ — ใช้ถอยกลับตอนคืนเงินการต่ออายุ (ดู si_expires_before)
+    const expiresBefore = await snapshotExpiries(order.ord_customer_id, items.map((i) => i.oi_product_id));
+
     const entitlementIds = [];
+    const entIdByProduct = new Map();
     for (const item of items) {
         const entId = await grantOrRenewProduct(order.ord_customer_id, item.oi_product_id, null, item.prod_entitlement_duration_months, "payment");
-        if (entId) entitlementIds.push(entId);
+        if (entId) {
+            entitlementIds.push(entId);
+            entIdByProduct.set(item.oi_product_id, entId);
+        }
     }
     if (coupon) await incrementUsage(coupon.cpn_id);
 
@@ -406,7 +417,8 @@ async function settlePaidOrder(orderId) {
     // ส่ง ord_discount ที่ checkout() คำนวณไว้ถูกต้องอยู่แล้วเข้าไปตรงๆ (ครอบคลุมทั้งส่วนลดคูปองและ
     // ส่วนลดแพ็กเกจ) แทนที่จะปล่อยให้ recordSale คำนวณจาก coupon อย่างเดียว — เพราะออเดอร์จากแพ็กเกจ
     // ไม่มี ord_coupon_id เลย (เป็น NULL) ถ้าไม่ส่ง override ไป ส่วนลดแพ็กเกจจะหายไปเงียบๆ ตอนบันทึกยอดขาย
-    await recordSale(order.ord_customer_id, productIds, coupon, null, gatewayFee, Number(order.ord_discount), order.ord_package_id);
+    const saleId = await recordSale(order.ord_customer_id, productIds, coupon, null, gatewayFee, Number(order.ord_discount), order.ord_package_id, order.ord_id);
+    await linkEntitlementsToSale(saleId, entIdByProduct, expiresBefore);
 
     await sendReceiptEmail(order, items, entitlementIds);
 

@@ -270,6 +270,18 @@ router.put(
     requirePermission("editCustomer"),
     entitlementController.revoke
 );
+router.put(
+    "/V1/entitlements/:id/restore",
+    requireAuth,
+    requirePermission("editCustomer"),
+    entitlementController.restore
+);
+router.put(
+    "/V1/entitlements/:id/expiry",
+    requireAuth,
+    requirePermission("editCustomer"),
+    entitlementController.updateExpiry
+);
 
 // ─── coupons (คูปอง/โค้ดส่วนลด) ───────────────────────────────────────────────
 // อนุญาต createCustomer ด้วย (ไม่ใช่แค่ couponsManagement) เพราะ dropdown เลือกโค้ดใน GrantProductsModal
@@ -317,6 +329,7 @@ router.get("/V1/reports/package-ranking", requireAuth, requirePermission("report
 router.get("/V1/reports/free-to-paid-conversion", requireAuth, requirePermission("reportsManagement"), reportController.getFreeToPaidConversion);
 router.get("/V1/reports/daily-sales-trend", requireAuth, requirePermission("reportsManagement"), reportController.getDailySalesTrend);
 router.get("/V1/reports/top-categories", requireAuth, requirePermission("reportsManagement"), reportController.getTopCategories);
+router.get("/V1/reports/sales-by-channel", requireAuth, requirePermission("reportsManagement"), reportController.getSalesByChannel);
 
 // ─── payroll (เงินเดือนพนักงาน) ───────────────────────────────────────────────────
 // /run-status ต้องมาก่อน /:id เสมอ ไม่งั้น Express จะจับ "run-status" เป็นค่า :id ของ route ด้านล่างไปก่อน
