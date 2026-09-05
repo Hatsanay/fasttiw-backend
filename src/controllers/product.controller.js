@@ -4,6 +4,7 @@ const sharp = require("sharp");
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { resolveUploadPath } = require("../utils/uploads");
+const { validateTotalScore, normalizeTotalScore, checkScoreBudget, sumActiveQuestionScore } = require("../utils/scoring");
 
 const PRODUCT_COVER_DIR = path.join(__dirname, "..", "..", "uploads", "products");
 
@@ -32,7 +33,7 @@ async function getAll(req, res, next) {
 
         const [rows] = await pool.query(
             `SELECT p.prod_id, p.prod_name, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
-                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months,
+                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score,
                     p.prod_created_at, p.prod_updated_at,
                     c.cat_name AS prod_category_name
              FROM tb_products p
@@ -58,7 +59,7 @@ async function getOne(req, res, next) {
         const [rows] = await pool.query(
             `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
                     p.prod_category_id, p.prod_commission_staff_id, p.prod_commission_type, p.prod_commission_value,
-                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months,
+                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score,
                     p.prod_created_at, p.prod_updated_at,
                     c.cat_name AS prod_category_name
              FROM tb_products p
@@ -67,7 +68,9 @@ async function getOne(req, res, next) {
             [req.params.id]
         );
         if (!rows[0]) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
-        res.json(rows[0]);
+        // used_score = ผลรวมคะแนนของข้อที่ active อยู่ตอนนี้ ส่งไปให้หน้าแอดมินโชว์ตัวนับ "ใช้ไป 95/100"
+        // และเตือนล่วงหน้าได้ก่อนกดบันทึกว่าคะแนนเต็มใหม่จะต่ำกว่าที่ใช้ไปแล้ว
+        res.json({ ...rows[0], used_score: await sumActiveQuestionScore(req.params.id) });
     } catch (err) {
         next(err);
     }
@@ -136,7 +139,7 @@ async function create(req, res, next) {
         const {
             prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
-            prod_exam_duration_minutes, prod_entitlement_duration_months,
+            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score,
         } = req.body;
         if (!prod_name) return res.status(400).json({ message: "กรุณากรอกชื่อชุดข้อสอบ" });
 
@@ -146,6 +149,8 @@ async function create(req, res, next) {
         if (durationError) return res.status(400).json({ message: durationError });
         const entitlementDurationError = validateEntitlementDuration(prod_entitlement_duration_months);
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
+        const totalScoreError = validateTotalScore(prod_total_score);
+        if (totalScoreError) return res.status(400).json({ message: totalScoreError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -156,12 +161,12 @@ async function create(req, res, next) {
             `INSERT INTO tb_products
                 (prod_id, prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id, prod_created_by_id,
                  prod_commission_staff_id, prod_commission_type, prod_commission_value, prod_exam_duration_minutes,
-                 prod_entitlement_duration_months)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 prod_entitlement_duration_months, prod_total_score)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 prod_id, prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, prod_category_id || null, req.user.user_id,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
-                prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null,
+                prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null, normalizeTotalScore(prod_total_score),
             ]
         );
 
@@ -176,7 +181,7 @@ async function update(req, res, next) {
         const {
             prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_status, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
-            prod_exam_duration_minutes, prod_entitlement_duration_months,
+            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score,
         } = req.body;
         if (!prod_name) return res.status(400).json({ message: "กรุณากรอกชื่อชุดข้อสอบ" });
 
@@ -186,6 +191,8 @@ async function update(req, res, next) {
         if (durationError) return res.status(400).json({ message: durationError });
         const entitlementDurationError = validateEntitlementDuration(prod_entitlement_duration_months);
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
+        const totalScoreError = validateTotalScore(prod_total_score);
+        if (totalScoreError) return res.status(400).json({ message: totalScoreError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -193,16 +200,24 @@ async function update(req, res, next) {
 
         const status = ["draft", "published", "archived"].includes(prod_status) ? prod_status : "draft";
 
+        // ห้ามลดคะแนนเต็มลงจนต่ำกว่าผลรวมคะแนนของข้อที่มีอยู่แล้ว — เป็นทางที่ผลรวมจะ "เกิน" ได้โดยไม่ต้อง
+        // แตะคำถามสักข้อ จึงต้องเช็คที่นี่ด้วย ไม่ใช่เช็คแค่ตอนสร้าง/แก้คำถาม
+        const budgetError = await checkScoreBudget({
+            productId: req.params.id,
+            totalScore: normalizeTotalScore(prod_total_score),
+        });
+        if (budgetError) return res.status(400).json({ message: budgetError });
+
         await pool.query(
             `UPDATE tb_products SET prod_name = ?, prod_description = ?, prod_price = ?, prod_compare_price = ?, prod_is_free = ?,
                     prod_status = ?, prod_category_id = ?,
                     prod_commission_staff_id = ?, prod_commission_type = ?, prod_commission_value = ?,
-                    prod_exam_duration_minutes = ?, prod_entitlement_duration_months = ?
+                    prod_exam_duration_minutes = ?, prod_entitlement_duration_months = ?, prod_total_score = ?
              WHERE prod_id = ?`,
             [
                 prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, status, prod_category_id || null,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
-                prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null,
+                prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null, normalizeTotalScore(prod_total_score),
                 req.params.id,
             ]
         );

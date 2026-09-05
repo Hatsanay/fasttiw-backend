@@ -146,7 +146,7 @@ async function getPublicProduct(req, res, next) {
 async function getSampleQuestions(req, res, next) {
     try {
         const [productRows] = await pool.query(
-            "SELECT prod_id FROM tb_products WHERE prod_id = ? AND prod_status = 'published'",
+            "SELECT prod_id, prod_total_score FROM tb_products WHERE prod_id = ? AND prod_status = 'published'",
             [req.params.id]
         );
         if (!productRows[0]) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
@@ -160,7 +160,8 @@ async function getSampleQuestions(req, res, next) {
             return buildQuestionPayload(question, choiceOrder, null, true);
         });
 
-        res.json({ data: questions });
+        // prod_total_score = null แปลว่าชุดนี้ไม่ใช้ระบบคะแนน หน้าตัวอย่างจะไม่โชว์คะแนนเลย
+        res.json({ data: questions, prod_total_score: productRows[0].prod_total_score });
     } catch (err) {
         next(err);
     }

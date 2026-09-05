@@ -28,6 +28,9 @@ function buildQuestionPayload(question, choiceOrder, answer, reveal) {
         ques_id: question.ques_id,
         ques_text: question.ques_text,
         ques_image_url: question.ques_image_url ?? null,
+        // คะแนนของข้อนี้ — ใช้ ans_score ที่ freeze ไว้ตอนเริ่มทำก่อนเสมอ ถ้าไม่มี (attempt ที่สร้างก่อนมี
+        // ระบบคะแนน หรือหน้าตัวอย่างฟรีที่ไม่มี attempt) ค่อยตกมาใช้ค่าปัจจุบันของคำถาม
+        ques_score: answer?.ans_score ?? question.ques_score ?? null,
         choices: orderedChoices.map((c) => ({ cho_id: c.cho_id, cho_text: c.cho_text, cho_image_url: c.cho_image_url ?? null })),
         selected_choice_id: answer?.ans_selected_choice_id ?? null,
         reveal: reveal
@@ -52,7 +55,7 @@ function buildQuestionPayload(question, choiceOrder, answer, reveal) {
 // (ไม่สลับสุ่มแล้ว — ดู startOrResumeAttempt)
 async function fetchQuestionsWithChoices(productId) {
     const [questions] = await pool.query(
-        `SELECT ques_id, ques_text, ques_explanation, ques_image_url FROM tb_questions
+        `SELECT ques_id, ques_text, ques_explanation, ques_image_url, ques_score FROM tb_questions
          WHERE ques_product_id = ? AND ques_status = 'active' ORDER BY ques_order ASC`,
         [productId]
     );
@@ -65,7 +68,7 @@ async function fetchQuestionsWithChoices(productId) {
 async function fetchQuestionsByIds(questionIds) {
     if (questionIds.length === 0) return {};
     const [questions] = await pool.query(
-        `SELECT ques_id, ques_text, ques_explanation, ques_image_url FROM tb_questions
+        `SELECT ques_id, ques_text, ques_explanation, ques_image_url, ques_score FROM tb_questions
          WHERE ques_id IN (?) AND ques_status = 'active'`,
         [questionIds]
     );
@@ -77,7 +80,7 @@ async function fetchQuestionsByIds(questionIds) {
 // ไม่ต้อง login เรียกได้อิสระ ถ้า product มีคำถามเยอะจะโดนดึงข้อมูลทิ้งจำนวนมากทุกครั้งที่มีคนเข้าดูตัวอย่าง
 async function fetchSampleQuestions(productId, limit) {
     const [questions] = await pool.query(
-        `SELECT ques_id, ques_text, ques_explanation, ques_image_url FROM tb_questions
+        `SELECT ques_id, ques_text, ques_explanation, ques_image_url, ques_score FROM tb_questions
          WHERE ques_product_id = ? AND ques_status = 'active' ORDER BY ques_id ASC LIMIT ?`,
         [productId, limit]
     );
@@ -119,7 +122,8 @@ async function requireStillEntitled(customerId, productId, res) {
 async function loadOwnAttempt(attemptId, customerId) {
     const [rows] = await pool.query(
         `SELECT att_id, att_customer_id, att_product_id, att_mode, att_status, att_question_order,
-                att_score, att_total_questions, att_time_limit_minutes, att_started_at, att_submitted_at
+                att_score, att_earned_score, att_max_score, att_total_questions,
+                att_time_limit_minutes, att_started_at, att_submitted_at
          FROM tb_attempts WHERE att_id = ? AND att_customer_id = ?`,
         [attemptId, customerId]
     );
@@ -132,7 +136,7 @@ async function buildAttemptResponse(attempt) {
     const questionMap = await fetchQuestionsByIds(questionOrder);
 
     const [answers] = await pool.query(
-        `SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct
+        `SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct, ans_score
          FROM tb_attempt_answers WHERE ans_attempt_id = ?`,
         [attempt.att_id]
     );
@@ -156,6 +160,8 @@ async function buildAttemptResponse(attempt) {
         att_mode: attempt.att_mode,
         att_status: attempt.att_status,
         att_score: attempt.att_score,
+        att_earned_score: attempt.att_earned_score,
+        att_max_score: attempt.att_max_score,
         att_total_questions: attempt.att_total_questions,
         att_time_limit_minutes: attempt.att_time_limit_minutes,
         att_started_at: attempt.att_started_at,
@@ -185,7 +191,7 @@ async function startOrResumeAttempt(req, res, next) {
         }
 
         const [productRows] = await pool.query(
-            "SELECT prod_exam_duration_minutes FROM tb_products WHERE prod_id = ?",
+            "SELECT prod_exam_duration_minutes, prod_total_score FROM tb_products WHERE prod_id = ?",
             [productId]
         );
         if (!productRows[0]) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
@@ -202,6 +208,11 @@ async function startOrResumeAttempt(req, res, next) {
         // เปลี่ยนกลางอากาศ)
         const timeLimitMinutes = mode === "timed" ? productRows[0].prod_exam_duration_minutes : null;
 
+        // snapshot คะแนนเต็ม + คะแนนรายข้อไว้ตั้งแต่ตอนเริ่ม ด้วยเหตุผลเดียวกับ att_question_order ข้างบน —
+        // ถ้าอ่านสดตอน submit แอดมินแก้คะแนนระหว่างที่ลูกค้ากำลังทำอยู่ ผลสอบจะเพี้ยนโดยไม่มีใครรู้
+        // maxScore เป็น null = ชุดนี้ไม่ใช้ระบบคะแนน (คิดผลเป็น % จากจำนวนข้อเหมือนเดิม)
+        const maxScore = productRows[0].prod_total_score;
+
         const conn = await pool.getConnection();
         try {
             await conn.beginTransaction();
@@ -210,9 +221,9 @@ async function startOrResumeAttempt(req, res, next) {
             await conn.query(
                 `INSERT INTO tb_attempts
                     (att_id, att_customer_id, att_product_id, att_mode, att_question_order,
-                     att_total_questions, att_time_limit_minutes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [att_id, req.customer.cus_id, productId, mode, JSON.stringify(questionIds), questionIds.length, timeLimitMinutes]
+                     att_max_score, att_total_questions, att_time_limit_minutes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [att_id, req.customer.cus_id, productId, mode, JSON.stringify(questionIds), maxScore, questionIds.length, timeLimitMinutes]
             );
 
             // INSERT รวมทีเดียวแทนการวน query ทีละแถว (เดิม 1 คำถาม = 1 round trip ไป DB) — product ที่มี
@@ -220,11 +231,13 @@ async function startOrResumeAttempt(req, res, next) {
             const answerIds = await generateIds("tb_attempt_answers", "ANS", questionIds.length);
             const answerRows = questionIds.map((quesId, i) => {
                 const choiceOrder = questionMap[quesId].choices.map((c) => c.cho_id);
-                return [answerIds[i], att_id, quesId, JSON.stringify(choiceOrder)];
+                // ans_score เก็บเฉพาะชุดที่ใช้ระบบคะแนน ชุดอื่นปล่อย null ไว้ให้ชัดว่าไม่มีความหมาย
+                const score = maxScore === null ? null : questionMap[quesId].ques_score;
+                return [answerIds[i], att_id, quesId, JSON.stringify(choiceOrder), score];
             });
             if (answerRows.length > 0) {
                 await conn.query(
-                    `INSERT INTO tb_attempt_answers (ans_id, ans_attempt_id, ans_question_id, ans_choice_order) VALUES ?`,
+                    `INSERT INTO tb_attempt_answers (ans_id, ans_attempt_id, ans_question_id, ans_choice_order, ans_score) VALUES ?`,
                     [answerRows]
                 );
             }
@@ -327,18 +340,39 @@ async function submitAttempt(req, res, next) {
             return res.status(400).json({ message: "ทำข้อสอบชุดนี้เสร็จไปแล้ว" });
         }
 
-        const [[{ correctCount }]] = await pool.query(
-            "SELECT COUNT(*) AS correctCount FROM tb_attempt_answers WHERE ans_attempt_id = ? AND ans_is_correct = TRUE",
+        const [[{ correctCount, earnedScore }]] = await pool.query(
+            `SELECT COUNT(*) AS correctCount, COALESCE(SUM(ans_score), 0) AS earnedScore
+             FROM tb_attempt_answers WHERE ans_attempt_id = ? AND ans_is_correct = TRUE`,
             [attempt.att_id]
         );
-        const score = attempt.att_total_questions > 0 ? (correctCount / attempt.att_total_questions) * 100 : 0;
+
+        // สองโหมดคิดคะแนน — แยกที่ att_max_score ที่ freeze ไว้ตอนเริ่มทำ ไม่ใช่ค่าปัจจุบันของ product
+        // (ถ้าแอดมินเพิ่งเปิด/ปิดระบบคะแนนระหว่างที่ลูกค้ากำลังทำอยู่ ต้องยึดกติกา ณ ตอนเริ่มเสมอ)
+        //
+        // att_score ยังเป็น "เปอร์เซ็นต์" เหมือนเดิมทั้งสองโหมด — ประวัติเก่าและกราฟหน้า /history จึงใช้ต่อได้
+        // โดยไม่ต้องแก้อะไร ส่วนคะแนนดิบเก็บแยกที่ att_earned_score
+        const maxScore = attempt.att_max_score === null ? null : Number(attempt.att_max_score);
+        const useScoring = maxScore !== null && maxScore > 0;
+        const earned = useScoring ? Math.round(Number(earnedScore) * 100) / 100 : null;
+        const score = useScoring
+            ? (earned / maxScore) * 100
+            : attempt.att_total_questions > 0
+              ? (correctCount / attempt.att_total_questions) * 100
+              : 0;
 
         await pool.query(
-            "UPDATE tb_attempts SET att_status = 'submitted', att_score = ?, att_submitted_at = NOW() WHERE att_id = ?",
-            [score.toFixed(2), attempt.att_id]
+            "UPDATE tb_attempts SET att_status = 'submitted', att_score = ?, att_earned_score = ?, att_submitted_at = NOW() WHERE att_id = ?",
+            [score.toFixed(2), earned, attempt.att_id]
         );
 
-        res.json({ att_id: attempt.att_id, score: Number(score.toFixed(2)), correct_count: correctCount, total_questions: attempt.att_total_questions });
+        res.json({
+            att_id: attempt.att_id,
+            score: Number(score.toFixed(2)),
+            correct_count: correctCount,
+            total_questions: attempt.att_total_questions,
+            earned_score: earned,
+            max_score: useScoring ? maxScore : null,
+        });
     } catch (err) {
         next(err);
     }
@@ -378,7 +412,7 @@ async function getReview(req, res, next) {
         const questionOrder = parseJsonColumn(attempt.att_question_order) ?? [];
         const questionMap = await fetchQuestionsByIds(questionOrder);
         const [answers] = await pool.query(
-            "SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct FROM tb_attempt_answers WHERE ans_attempt_id = ?",
+            "SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct, ans_score FROM tb_attempt_answers WHERE ans_attempt_id = ?",
             [attempt.att_id]
         );
         const answerByQuestion = Object.fromEntries(answers.map((a) => [a.ans_question_id, a]));
@@ -406,6 +440,8 @@ async function getReview(req, res, next) {
             prod_name: product?.prod_name ?? "",
             att_mode: attempt.att_mode,
             att_score: attempt.att_score,
+            att_earned_score: attempt.att_earned_score,
+            att_max_score: attempt.att_max_score,
             att_total_questions: attempt.att_total_questions,
             att_submitted_at: attempt.att_submitted_at,
             questions,
@@ -431,9 +467,19 @@ async function getWeakAreas(req, res, next) {
         }
 
         const [rows] = await pool.query(
+            // คิดเป็น "คะแนนที่ได้ / คะแนนเต็มของหมวดนั้น" โดยใช้ COALESCE(ans_score, 1) — คำตอบจากชุดที่ไม่ใช้
+            // ระบบคะแนน (ans_score เป็น NULL) นับเป็นข้อละ 1 คะแนน ผลลัพธ์จึงเท่ากับการนับจำนวนข้อแบบเดิมเป๊ะ
+            // ไม่มีอะไรเปลี่ยนสำหรับลูกค้าที่ยังไม่เคยทำชุดที่ใช้ระบบคะแนน แต่พอมีชุดที่ให้น้ำหนักต่างกัน หมวดที่
+            // "เสียคะแนนเยอะ" จะลอยขึ้นมาก่อนหมวดที่พลาดหลายข้อแต่ข้อละคะแนนน้อย ซึ่งตรงกับความเป็นจริงกว่า
+            //
+            // scored_answers ใช้บอกฝั่งหน้าเว็บว่าหมวดนี้มีคำตอบจากชุดที่ใช้ระบบคะแนนปนอยู่ไหม จะได้เลือกคำ
+            // ที่ใช้แสดงผลให้ตรง ("ได้ 13.5 จาก 30 คะแนน" กับ "ถูก 9 จาก 20 ข้อ")
             `SELECT t.tpc_id, t.tpc_name,
                     SUM(a.ans_is_correct) AS correct,
-                    COUNT(*) AS total
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN a.ans_is_correct THEN COALESCE(a.ans_score, 1) ELSE 0 END) AS earned,
+                    SUM(COALESCE(a.ans_score, 1)) AS possible,
+                    SUM(a.ans_score IS NOT NULL) AS scored_answers
              FROM tb_attempt_answers a
              JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
              JOIN tb_questions q ON q.ques_id = a.ans_question_id
@@ -441,7 +487,7 @@ async function getWeakAreas(req, res, next) {
              WHERE ${conditions.join(" AND ")}
              GROUP BY t.tpc_id, t.tpc_name
              HAVING COUNT(*) >= ?
-             ORDER BY (SUM(a.ans_is_correct) / COUNT(*)) ASC`,
+             ORDER BY (SUM(CASE WHEN a.ans_is_correct THEN COALESCE(a.ans_score, 1) ELSE 0 END) / SUM(COALESCE(a.ans_score, 1))) ASC`,
             [...params, MIN_TOPIC_SAMPLE]
         );
 
@@ -450,7 +496,10 @@ async function getWeakAreas(req, res, next) {
             tpc_name: r.tpc_name,
             correct: Number(r.correct),
             total: Number(r.total),
-            accuracy: Math.round((Number(r.correct) / Number(r.total)) * 100),
+            earned: Number(r.earned),
+            possible: Number(r.possible),
+            scored: Number(r.scored_answers) > 0,
+            accuracy: Math.round((Number(r.earned) / Number(r.possible)) * 100),
         }));
         res.json({ data });
     } catch (err) {
@@ -462,7 +511,8 @@ async function getAttemptHistory(req, res, next) {
     try {
         const [rows] = await pool.query(
             `SELECT a.att_id, a.att_product_id, p.prod_name, a.att_mode, a.att_status,
-                    a.att_score, a.att_total_questions, a.att_started_at, a.att_submitted_at
+                    a.att_score, a.att_earned_score, a.att_max_score, a.att_total_questions,
+                    a.att_started_at, a.att_submitted_at
              FROM tb_attempts a JOIN tb_products p ON p.prod_id = a.att_product_id
              WHERE a.att_customer_id = ?
              ORDER BY a.att_started_at DESC`,
@@ -490,7 +540,7 @@ async function exportPrintableQuestions(req, res, next) {
             return res.status(403).json({ message: "สิทธิ์เข้าถึงชุดข้อสอบนี้หมดอายุหรือถูกยกเลิกไปแล้ว" });
         }
 
-        const [productRows] = await pool.query("SELECT prod_name FROM tb_products WHERE prod_id = ?", [productId]);
+        const [productRows] = await pool.query("SELECT prod_name, prod_total_score FROM tb_products WHERE prod_id = ?", [productId]);
         if (productRows.length === 0) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
 
         const questionMap = await fetchQuestionsWithChoices(productId);
@@ -504,7 +554,9 @@ async function exportPrintableQuestions(req, res, next) {
             return buildQuestionPayload(question, choiceOrder, null, withAnswers);
         });
 
-        res.json({ prod_name: productRows[0].prod_name, questions });
+        // ไม่มี attempt จึงไม่มี snapshot — ใช้คะแนนเต็มปัจจุบันของชุด (null = ชุดนี้ไม่ใช้ระบบคะแนน
+        // ฝั่ง PDF จะไม่พิมพ์คะแนนเลย)
+        res.json({ prod_name: productRows[0].prod_name, prod_total_score: productRows[0].prod_total_score, questions });
     } catch (err) {
         next(err);
     }

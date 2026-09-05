@@ -7,6 +7,7 @@ const { parseQuestionFile } = require("../utils/parseQuestionFile");
 const { generateQuestionTemplate } = require("../utils/generateQuestionTemplate");
 const { generateQuestionExport } = require("../utils/generateQuestionExport");
 const { resolveUploadPath } = require("../utils/uploads");
+const { validateQuestionScore, normalizeQuestionScore, checkScoreBudget, sumActiveQuestionScore } = require("../utils/scoring");
 
 const QUESTION_IMAGE_DIR = path.join(__dirname, "..", "..", "uploads", "questions");
 const CHOICE_IMAGE_DIR = path.join(__dirname, "..", "..", "uploads", "choices");
@@ -29,7 +30,7 @@ async function getAll(req, res, next) {
         const search = `%${req.query.search ?? ""}%`;
 
         const [questions] = await pool.query(
-            `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, q.ques_order, t.tpc_name AS ques_topic_name
+            `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, q.ques_order, q.ques_score, q.ques_status, t.tpc_name AS ques_topic_name
              FROM tb_questions q
              LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
              WHERE q.ques_product_id = ? AND q.ques_text LIKE ?
@@ -42,7 +43,15 @@ async function getAll(req, res, next) {
             [req.params.productId, search]
         );
 
-        if (questions.length === 0) return res.json({ data: [], total });
+        // สรุปคะแนนของชุดส่งไปด้วยทุกครั้ง ให้หน้าจัดการคำถามโชว์ "คะแนนเต็ม / ใช้ไปแล้ว" ได้โดยไม่ต้องยิง API ซ้ำ
+        // (total_score เป็น null = ชุดนี้ไม่ใช้ระบบคะแนน ฝั่งหน้าเว็บจะซ่อนคอลัมน์คะแนนไปเลย)
+        const [[productScore]] = await pool.query("SELECT prod_total_score FROM tb_products WHERE prod_id = ?", [req.params.productId]);
+        const scoring = {
+            total_score: productScore ? productScore.prod_total_score : null,
+            used_score: await sumActiveQuestionScore(req.params.productId),
+        };
+
+        if (questions.length === 0) return res.json({ data: [], total, scoring });
 
         const [choices] = await pool.query(
             `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url, cho_order
@@ -55,7 +64,7 @@ async function getAll(req, res, next) {
             choices: choices.filter((c) => c.cho_question_id === q.ques_id),
         }));
 
-        res.json({ data, total });
+        res.json({ data, total, scoring });
     } catch (err) {
         next(err);
     }
@@ -74,7 +83,7 @@ async function exportQuestions(req, res, next) {
         if (!product) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
 
         const [questions] = await pool.query(
-            `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, t.tpc_name AS ques_topic_name
+            `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, q.ques_score, t.tpc_name AS ques_topic_name
              FROM tb_questions q
              LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
              WHERE q.ques_product_id = ?
@@ -107,6 +116,7 @@ async function exportQuestions(req, res, next) {
                 questionText: q.ques_text,
                 explanation: q.ques_explanation,
                 topicName: q.ques_topic_name,
+                score: Number(q.ques_score),
                 image: await loadImage(q.ques_image_url),
                 choices: await Promise.all(questionChoices.map(async (c) => ({
                     text: c.cho_text,
@@ -130,7 +140,7 @@ async function getOne(req, res, next) {
     try {
         const [[question]] = await pool.query(
             `SELECT q.ques_id, q.ques_product_id, q.ques_text, q.ques_explanation, q.ques_image_url,
-                    q.ques_topic_id, q.ques_order
+                    q.ques_topic_id, q.ques_order, q.ques_score
              FROM tb_questions q WHERE q.ques_id = ?`,
             [req.params.id]
         );
@@ -142,7 +152,14 @@ async function getOne(req, res, next) {
             [question.ques_id]
         );
 
-        res.json({ ...question, choices });
+        // แนบโควตาคะแนนที่ "ไม่นับข้อนี้" มาด้วย ฟอร์มแก้ไขจะได้บอกได้ทันทีว่าข้อนี้ใส่ได้สูงสุดเท่าไร
+        const [[product]] = await pool.query("SELECT prod_total_score FROM tb_products WHERE prod_id = ?", [question.ques_product_id]);
+        const scoring = {
+            total_score: product ? product.prod_total_score : null,
+            used_score_excluding_this: await sumActiveQuestionScore(question.ques_product_id, { excludeQuestionIds: [question.ques_id] }),
+        };
+
+        res.json({ ...question, choices, scoring });
     } catch (err) {
         next(err);
     }
@@ -166,11 +183,11 @@ function validateChoices(choices) {
 // insert คำถาม 1 ข้อ + ตัวเลือกของมัน โดยรับ id ที่จองไว้ล่วงหน้ามาแล้ว (ไม่เรียก generateId ในนี้)
 // เพราะตอนสร้างหลายข้อพร้อมกัน (createBatch/importFile) ต้องจองไอดีเป็นชุดเดียวก่อนเข้าลูป
 // ไม่ใช่ขอทีละอันต่อคำถาม/ตัวเลือก — ลดจำนวน round-trip ไป DB ได้มหาศาลตอนมีข้อมูลเยอะ
-async function insertQuestionWithChoices(conn, productId, order, quesId, choiceIds, { ques_text, ques_explanation, ques_topic_id, choices }) {
+async function insertQuestionWithChoices(conn, productId, order, quesId, choiceIds, { ques_text, ques_explanation, ques_topic_id, ques_score, choices }) {
     await conn.query(
-        `INSERT INTO tb_questions (ques_id, ques_product_id, ques_topic_id, ques_text, ques_explanation, ques_order)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [quesId, productId, ques_topic_id || null, ques_text, ques_explanation || null, order]
+        `INSERT INTO tb_questions (ques_id, ques_product_id, ques_topic_id, ques_text, ques_explanation, ques_order, ques_score)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [quesId, productId, ques_topic_id || null, ques_text, ques_explanation || null, order, normalizeQuestionScore(ques_score)]
     );
 
     for (let ci = 0; ci < choices.length; ci++) {
@@ -186,16 +203,24 @@ async function insertQuestionWithChoices(conn, productId, order, quesId, choiceI
 async function create(req, res, next) {
     const conn = await pool.getConnection();
     try {
-        const { ques_text, choices } = req.body;
+        const { ques_text, ques_score, choices } = req.body;
         if (!ques_text?.trim()) return res.status(400).json({ message: "กรุณากรอกคำถาม" });
 
         const choicesError = validateChoices(choices);
         if (choicesError) return res.status(400).json({ message: choicesError });
+        const scoreError = validateQuestionScore(ques_score);
+        if (scoreError) return res.status(400).json({ message: scoreError });
 
         const [[product]] = await pool.query("SELECT prod_id FROM tb_products WHERE prod_id = ?", [
             req.params.productId,
         ]);
         if (!product) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
+
+        const budgetError = await checkScoreBudget({
+            productId: req.params.productId,
+            addScore: normalizeQuestionScore(ques_score),
+        });
+        if (budgetError) return res.status(400).json({ message: budgetError });
 
         const [[{ maxOrder }]] = await pool.query(
             "SELECT COALESCE(MAX(ques_order), -1) AS maxOrder FROM tb_questions WHERE ques_product_id = ?",
@@ -233,6 +258,8 @@ async function createBatch(req, res, next) {
             if (!q.ques_text?.trim()) errors.push(`ข้อที่ ${i + 1}: กรุณากรอกคำถาม`);
             const choicesError = validateChoices(q.choices);
             if (choicesError) errors.push(`ข้อที่ ${i + 1}: ${choicesError}`);
+            const scoreError = validateQuestionScore(q.ques_score);
+            if (scoreError) errors.push(`ข้อที่ ${i + 1}: ${scoreError}`);
         });
         if (errors.length > 0) {
             return res.status(422).json({ message: "พบข้อผิดพลาด กรุณาแก้ไขก่อนบันทึก", errors });
@@ -242,6 +269,14 @@ async function createBatch(req, res, next) {
             req.params.productId,
         ]);
         if (!product) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
+
+        // เช็คโควตาจากผลรวมของ "ทุกข้อที่กำลังจะเพิ่ม" ทีเดียว ไม่ใช่ทีละข้อ — บันทึกแบบ all-or-nothing
+        // อยู่แล้ว ถ้าเช็คทีละข้อจะผ่านข้อแรกๆ แล้วไปตกข้อท้าย ทั้งที่ผลลัพธ์คือไม่มีอะไรถูกบันทึกเหมือนกัน
+        const budgetError = await checkScoreBudget({
+            productId: req.params.productId,
+            addScore: questions.reduce((sum, q) => sum + normalizeQuestionScore(q.ques_score), 0),
+        });
+        if (budgetError) return res.status(400).json({ message: budgetError });
 
         const [[{ maxOrder }]] = await pool.query(
             "SELECT COALESCE(MAX(ques_order), -1) AS maxOrder FROM tb_questions WHERE ques_product_id = ?",
@@ -283,18 +318,31 @@ async function createBatch(req, res, next) {
 async function update(req, res, next) {
     const conn = await pool.getConnection();
     try {
-        const { ques_text, ques_explanation, ques_topic_id, choices } = req.body;
+        const { ques_text, ques_explanation, ques_topic_id, ques_score, choices } = req.body;
         if (!ques_text?.trim()) return res.status(400).json({ message: "กรุณากรอกคำถาม" });
 
         const choicesError = validateChoices(choices);
         if (choicesError) return res.status(400).json({ message: choicesError });
+        const scoreError = validateQuestionScore(ques_score);
+        if (scoreError) return res.status(400).json({ message: scoreError });
+
+        // ไม่นับคะแนนเดิมของข้อนี้ในผลรวม เพราะกำลังจะถูกแทนด้วยค่าใหม่ (ไม่งั้นแก้ข้อเดิมโดยไม่เปลี่ยน
+        // คะแนนเลยก็จะถูกมองว่าเกินโควตา)
+        const [[target]] = await pool.query("SELECT ques_product_id FROM tb_questions WHERE ques_id = ?", [req.params.id]);
+        if (!target) return res.status(404).json({ message: "ไม่พบคำถามนี้" });
+        const budgetError = await checkScoreBudget({
+            productId: target.ques_product_id,
+            addScore: normalizeQuestionScore(ques_score),
+            excludeQuestionIds: [req.params.id],
+        });
+        if (budgetError) return res.status(400).json({ message: budgetError });
 
         await conn.beginTransaction();
 
         const [result] = await conn.query(
-            `UPDATE tb_questions SET ques_text = ?, ques_explanation = ?, ques_topic_id = ?
+            `UPDATE tb_questions SET ques_text = ?, ques_explanation = ?, ques_topic_id = ?, ques_score = ?
              WHERE ques_id = ?`,
-            [ques_text, ques_explanation || null, ques_topic_id || null, req.params.id]
+            [ques_text, ques_explanation || null, ques_topic_id || null, normalizeQuestionScore(ques_score), req.params.id]
         );
         if (result.affectedRows === 0) {
             await conn.rollback();
@@ -626,9 +674,9 @@ async function runImportJob(jobId, productId, categoryId, questions) {
             const ques_id = quesIds[i];
             const ques_topic_id = q.topicName ? topicIdByName[q.topicName] : null;
             await conn.query(
-                `INSERT INTO tb_questions (ques_id, ques_product_id, ques_topic_id, ques_text, ques_explanation, ques_order)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [ques_id, productId, ques_topic_id, q.questionText, q.explanation, i]
+                `INSERT INTO tb_questions (ques_id, ques_product_id, ques_topic_id, ques_text, ques_explanation, ques_order, ques_score)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [ques_id, productId, ques_topic_id, q.questionText, q.explanation, i, normalizeQuestionScore(q.score)]
             );
 
             for (let ci = 0; ci < q.choices.length; ci++) {
@@ -707,6 +755,14 @@ async function importFile(req, res, next) {
         if (questions.length === 0) {
             return res.status(400).json({ message: "ไม่พบคำถามในไฟล์" });
         }
+
+        // เช็คโควตาคะแนนก่อนเริ่ม job — ถ้าปล่อยไปเช็คตอน insert จะกลายเป็น error ที่ผู้ใช้ต้องรอ poll
+        // ถึงจะเห็น ทั้งที่รู้ได้ตั้งแต่ตอนนี้ (นำเข้าเป็นการ "เพิ่ม" ต่อท้ายเสมอ ไม่ใช่แทนที่ของเดิม)
+        const budgetError = await checkScoreBudget({
+            productId: req.params.productId,
+            addScore: questions.reduce((sum, q) => sum + normalizeQuestionScore(q.score), 0),
+        });
+        if (budgetError) return res.status(422).json({ message: "นำเข้าไม่ได้", errors: [budgetError] });
 
         const jobId = createImportJob(questions.length);
         res.status(202).json({ jobId, total: questions.length });

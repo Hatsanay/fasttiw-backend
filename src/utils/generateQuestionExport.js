@@ -1,14 +1,8 @@
 const ExcelJS = require("exceljs");
 const {
-    CHOICE_COLUMNS, WRONG_REASON_COLUMNS, QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS, QUESTION_PASSAGE_COLUMN, MAX_CHOICES,
+    CHOICE_COLUMNS, WRONG_REASON_COLUMNS, QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS, QUESTION_PASSAGE_COLUMN,
+    SCORE_COLUMN, HEADER_COLUMNS,
 } = require("./parseQuestionFile");
-
-// ลำดับคอลัมน์ต้องตรงกับ generateQuestionTemplate.js เป๊ะ เพื่อให้ไฟล์ export กลับเข้า parseQuestionFile.js
-// ได้ทันทีโดยไม่ต้องแก้อะไร (export แล้ว import ซ้ำ = ต้อง round-trip ได้)
-const HEADER_COLUMNS = [
-    QUESTION_PASSAGE_COLUMN, QUESTION_IMAGE_COLUMN, "คำถาม", "วิธีคิด", "ข้อที่ถูก", "หมวดหมู่",
-    ...Array.from({ length: MAX_CHOICES }, (_, i) => [CHOICE_IMAGE_COLUMNS[i], CHOICE_COLUMNS[i], WRONG_REASON_COLUMNS[i]]).flat(),
-];
 
 // เลขคอลัมน์ (1-based) -> ตัวอักษรคอลัมน์ Excel เช่น 1->A, 24->X, 27->AA — ใช้ประกอบ range string ตอนวางรูป
 // (ไฟล์นี้มีแค่ 24 คอลัมน์เลยไม่มีทางเกิน Z จริงๆ แต่เขียนให้ถูกทั่วไปไว้เผื่อ HEADER_COLUMNS ขยายในอนาคต)
@@ -103,6 +97,9 @@ async function generateQuestionExport(questions) {
             "คำถาม": questionText,
             "วิธีคิด": q.explanation ?? "",
             "ข้อที่ถูก": correctIndex,
+            // ส่งออกคะแนนเสมอแม้ชุดนั้นยังไม่ได้ใช้ระบบคะแนน (ค่าจะเป็น 1 ทุกข้อ) เพื่อให้ไฟล์ที่ export ไป
+            // มีคอลัมน์ครบเหมือนเทมเพลต แก้แล้วนำกลับเข้าระบบได้ทันทีโดยไม่ต้องเพิ่มคอลัมน์เอง
+            [SCORE_COLUMN]: q.score ?? "",
             "หมวดหมู่": q.topicName ?? "",
         };
         CHOICE_COLUMNS.forEach((col, ci) => {

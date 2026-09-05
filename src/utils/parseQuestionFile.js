@@ -7,7 +7,25 @@ const WRONG_REASON_COLUMNS = Array.from({ length: MAX_CHOICES }, (_, i) => `เ�
 const QUESTION_IMAGE_COLUMN = "รูปคำถาม";
 const CHOICE_IMAGE_COLUMNS = Array.from({ length: MAX_CHOICES }, (_, i) => `รูปตัวเลือก${i + 1}`);
 const QUESTION_PASSAGE_COLUMN = "บทความร่วม";
+const SCORE_COLUMN = "คะแนน";
 const REQUIRED_COLUMNS = ["คำถาม", "ข้อที่ถูก", "ตัวเลือก1", "ตัวเลือก2"];
+
+// เพดานเดียวกับ backend/src/utils/scoring.js (ไม่ require มาใช้ตรงๆ เพราะไฟล์นี้ตั้งใจให้เป็น pure function
+// ไม่แตะฐานข้อมูล/โมดูลที่ต่อ DB — scoring.js require pool ไว้)
+const MAX_QUESTION_SCORE = 1000;
+
+// ลำดับคอลัมน์กลางที่ทั้งเทมเพลตนำเข้า (generateQuestionTemplate.js) และไฟล์ส่งออก (generateQuestionExport.js)
+// ต้องใช้ร่วมกัน — เดิมสองไฟล์นั้นประกาศ array นี้ซ้ำกันคนละที่พร้อมคอมเมนต์กำกับว่า "ต้องตรงกันเป๊ะ" ซึ่งแปลว่า
+// วันหนึ่งเพิ่มคอลัมน์แล้วลืมแก้อีกไฟล์เมื่อไร ไฟล์ที่ export ออกมาจะ import กลับไม่ได้ทันที ย้ายมาไว้ที่เดียว
+// ตรงนี้ (ที่เดียวกับที่ประกาศชื่อคอลัมน์อยู่แล้ว) เพื่อปิดโอกาสนั้นถาวร
+//
+// ลำดับตั้งใจให้ "บทความร่วม" นำหน้าสุด (เป็นบริบทระดับกลุ่ม กว้างกว่าคำถามเดี่ยวๆ) ตามด้วย "รูปคำถาม"
+// นำหน้า "คำถาม" เสมอ และแต่ละตัวเลือกจัดเป็นชุด 3 คอลัมน์ติดกัน (รูปตัวเลือกN, ตัวเลือกN, เหตุผลผิดN)
+// อ่านตามลำดับซ้ายไปขวาได้เป็นธรรมชาติเวลากรอกทีละตัวเลือก ไม่ต้องเลื่อนหน้าจอไปมา
+const HEADER_COLUMNS = [
+    QUESTION_PASSAGE_COLUMN, QUESTION_IMAGE_COLUMN, "คำถาม", "วิธีคิด", "ข้อที่ถูก", SCORE_COLUMN, "หมวดหมู่",
+    ...Array.from({ length: MAX_CHOICES }, (_, i) => [CHOICE_IMAGE_COLUMNS[i], CHOICE_COLUMNS[i], WRONG_REASON_COLUMNS[i]]).flat(),
+];
 
 async function loadWorkbook(buffer, filename) {
     const workbook = new ExcelJS.Workbook();
@@ -108,6 +126,7 @@ async function parseQuestionFile(buffer, filename) {
         const explanation = cellText(row, colIndex["วิธีคิด"]);
         const correctRaw = cellText(row, colIndex["ข้อที่ถูก"]);
         const topicName = cellText(row, colIndex["หมวดหมู่"]) || null;
+        const scoreRaw = cellText(row, colIndex[SCORE_COLUMN]);
         const sharedPassage = cellText(row, passageColIndex, { resolveMerge: true });
         const groupFirstRow = passageGroupFirstRow(row, passageColIndex);
         const rawChoices = CHOICE_COLUMNS.map((col, ci) => ({
@@ -150,6 +169,27 @@ async function parseQuestionFile(buffer, filename) {
             continue;
         }
 
+        // คะแนนของข้อ — ไม่บังคับกรอก เว้นว่าง = 1 คะแนน (ค่า default เดียวกับระดับ DB) และจะถูกเพิกเฉย
+        // ไปเลยถ้าชุดข้อสอบนั้นไม่ได้ตั้งคะแนนเต็มไว้ ส่วน "ผลรวมห้ามเกินคะแนนเต็ม" ตรวจที่ controller
+        // (importFile) เพราะต้องรู้ค่าคะแนนเต็มของ product ซึ่ง parser ตัวนี้ไม่แตะ DB
+        let score = null;
+        if (scoreRaw) {
+            const scoreNum = Number(scoreRaw);
+            if (!Number.isFinite(scoreNum) || scoreNum <= 0) {
+                errors.push(`แถวที่ ${r}: "${SCORE_COLUMN}" ต้องเป็นตัวเลขมากกว่า 0 (หรือเว้นว่างไว้ถ้าให้ข้อละ 1 คะแนน)`);
+                continue;
+            }
+            if (scoreNum > MAX_QUESTION_SCORE) {
+                errors.push(`แถวที่ ${r}: "${SCORE_COLUMN}" ต้องไม่เกิน ${MAX_QUESTION_SCORE}`);
+                continue;
+            }
+            if (Math.round(scoreNum * 100) !== scoreNum * 100) {
+                errors.push(`แถวที่ ${r}: "${SCORE_COLUMN}" มีทศนิยมได้ไม่เกิน 2 ตำแหน่ง`);
+                continue;
+            }
+            score = scoreNum;
+        }
+
         // ถ้าแถวนี้อยู่ในกลุ่ม merge ของ "บทความร่วม" ให้เอารูปที่วางไว้ที่แถวบนสุดของกลุ่ม (รูปตาราง/กราฟ
         // ที่ใช้ร่วมกันทั้งกลุ่ม) มาก่อน ถ้าไม่มีรูปที่แถวบนสุด (กลุ่มนี้ใช้บทความข้อความล้วนๆ ไม่มีรูป) ค่อย fallback
         // ไปดูรูปที่วางไว้เฉพาะแถวของตัวเอง (เผื่อโจทย์ข้อนั้นมีรูปประกอบเพิ่มเติมนอกเหนือจากบทความร่วม)
@@ -162,6 +202,7 @@ async function parseQuestionFile(buffer, filename) {
             questionText: sharedPassage ? `${sharedPassage}\n\n${questionText}` : questionText,
             explanation: explanation || null,
             topicName,
+            score,
             image: questionImage,
             choices: choices.map((c, ci) => ({
                 text: c.text,
@@ -177,5 +218,5 @@ async function parseQuestionFile(buffer, filename) {
 
 module.exports = {
     parseQuestionFile, MAX_CHOICES, CHOICE_COLUMNS, WRONG_REASON_COLUMNS, REQUIRED_COLUMNS,
-    QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS, QUESTION_PASSAGE_COLUMN,
+    QUESTION_IMAGE_COLUMN, CHOICE_IMAGE_COLUMNS, QUESTION_PASSAGE_COLUMN, SCORE_COLUMN, HEADER_COLUMNS,
 };
