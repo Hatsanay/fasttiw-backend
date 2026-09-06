@@ -451,6 +451,250 @@ async function getReview(req, res, next) {
     }
 }
 
+// นิยามเดียวของคำว่า "ข้อที่ยังต้องทบทวน" = เคยตอบผิด และครั้งล่าสุดที่ตอบยังผิดอยู่
+//
+// ใช้ร่วมกันระหว่างตัวนับรายชุดใน getProductSummary กับลิสต์จริงใน getMistakes — ถ้าแยกกันเขียน
+// วันไหนแก้ที่เดียวลืมอีกที่ ตัวเลข "ต้องทบทวน N ข้อ" บนหน้าสรุปจะไม่ตรงกับจำนวนการ์ดที่กดเข้าไปเห็นจริง
+// ซึ่งเป็นบั๊กที่ผู้ใช้เจอก่อนเราเสมอ
+const LATEST_CORRECT_SQL =
+    "SUBSTRING_INDEX(GROUP_CONCAT(a.ans_is_correct ORDER BY att.att_submitted_at DESC), ',', 1) + 0";
+const UNRESOLVED_MISTAKE_HAVING = "HAVING wrong_count > 0 AND latest_correct = 0";
+
+// สรุปผลแยกรายชุดข้อสอบ — ตอบคำถาม "ชุดไหนเราแม่นแล้ว ชุดไหนยังต้องซ้อม"
+//
+// ต่างจากสรุปภาพรวมใน getAttemptHistory ที่รวมทุกชุดเป็นก้อนเดียว (บอกได้แค่ว่าเก่งขึ้นโดยรวมไหม)
+// และต่างจากจุดอ่อนรายหมวดที่ตัดข้ามชุด (บอกว่าอ่อนเรื่องอะไร) — อันนี้บอกว่าควรกลับไปซ้อม "ชุดไหน"
+//
+// นับเฉพาะ attempt ที่ส่งคำตอบแล้ว เพราะที่ยกเลิก/ทำค้างไม่มีคะแนนให้สรุป (ของจริงมีเยอะกว่าที่ทำเสร็จ
+// เกือบเท่าตัว ถ้านับรวมค่าเฉลี่ยจะเพี้ยนทันที)
+async function getProductSummary(req, res, next) {
+    try {
+        const customerId = req.customer.cus_id;
+        const [rows] = await pool.query(
+            `SELECT a.att_product_id, p.prod_name,
+                    COUNT(*) AS attempts,
+                    ROUND(MAX(a.att_score), 2) AS best_score,
+                    ROUND(AVG(a.att_score), 1) AS avg_score,
+                    MAX(a.att_submitted_at) AS last_attempt_at,
+                    MAX(a.att_earned_score) AS best_earned_score,
+                    MAX(a.att_max_score) AS max_score,
+                    -- คะแนนครั้งล่าสุดของชุดนี้ ใช้เทียบกับคะแนนดีที่สุดว่ากำลังฟอร์มตกหรือเปล่า
+                    (SELECT b.att_score FROM tb_attempts b
+                      WHERE b.att_customer_id = ? AND b.att_product_id = a.att_product_id
+                        AND b.att_status = 'submitted'
+                      ORDER BY b.att_submitted_at DESC LIMIT 1) AS latest_score
+             FROM tb_attempts a
+             JOIN tb_products p ON p.prod_id = a.att_product_id
+             WHERE a.att_customer_id = ? AND a.att_status = 'submitted'
+             GROUP BY a.att_product_id, p.prod_name
+             ORDER BY last_attempt_at DESC`,
+            [customerId, customerId]
+        );
+
+        // จุดอ่อนรายหมวด "ของแต่ละชุด" — ดึงทีเดียวทุกชุดแล้วค่อยแจกเข้าแถว ไม่ยิงทีละชุด
+        // (ลูกค้าที่มี 10 ชุดจะกลายเป็น 10 query ทันทีถ้าทำแบบนั้น)
+        //
+        // สูตร accuracy ใช้ COALESCE(ans_score, 1) เหมือน getWeakAreas เป๊ะ — คำตอบจากชุดที่ไม่ใช้ระบบ
+        // คะแนนนับเป็นข้อละ 1 คะแนน ผลจึงเท่ากับการนับจำนวนข้อ ตัวเลขสองที่จึงตรงกันเสมอ
+        const [topicRows] = await pool.query(
+            `SELECT att.att_product_id, t.tpc_id, t.tpc_name,
+                    SUM(a.ans_is_correct) AS correct,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN a.ans_is_correct THEN COALESCE(a.ans_score, 1) ELSE 0 END) AS earned,
+                    SUM(COALESCE(a.ans_score, 1)) AS possible,
+                    SUM(a.ans_score IS NOT NULL) AS scored_answers
+             FROM tb_attempt_answers a
+             JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+             JOIN tb_questions q ON q.ques_id = a.ans_question_id
+             JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
+             WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
+             GROUP BY att.att_product_id, t.tpc_id, t.tpc_name
+             HAVING COUNT(*) >= ?
+             ORDER BY (SUM(CASE WHEN a.ans_is_correct THEN COALESCE(a.ans_score, 1) ELSE 0 END) / SUM(COALESCE(a.ans_score, 1))) ASC`,
+            [customerId, MIN_TOPIC_SAMPLE]
+        );
+
+        // จำนวน "ข้อที่ยังต้องทบทวน" ของแต่ละชุด — ตัวเลขนี้คือสิ่งที่ทำให้การ์ดสรุปกดต่อได้
+        // (จุดอ่อนบอกว่าอ่อนหมวดไหน แต่ไม่บอกว่ามีกี่ข้อรออยู่ และกดไปทำอะไรต่อไม่ได้)
+        const [mistakeRows] = await pool.query(
+            `SELECT m.att_product_id, COUNT(*) AS mistakes FROM (
+                SELECT att.att_product_id,
+                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                       ${LATEST_CORRECT_SQL} AS latest_correct
+                FROM tb_attempt_answers a
+                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+                WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
+                GROUP BY att.att_product_id, a.ans_question_id
+                ${UNRESOLVED_MISTAKE_HAVING}
+             ) m
+             GROUP BY m.att_product_id`,
+            [customerId]
+        );
+        const mistakesByProduct = {};
+        for (const m of mistakeRows) mistakesByProduct[m.att_product_id] = Number(m.mistakes);
+
+        const topicsByProduct = {};
+        for (const t of topicRows) {
+            (topicsByProduct[t.att_product_id] ??= []).push({
+                tpc_id: t.tpc_id,
+                tpc_name: t.tpc_name,
+                correct: Number(t.correct),
+                total: Number(t.total),
+                earned: Number(t.earned),
+                possible: Number(t.possible),
+                scored: Number(t.scored_answers) > 0,
+                accuracy: Math.round((Number(t.earned) / Number(t.possible)) * 100),
+            });
+        }
+
+        res.json({
+            data: rows.map((r) => ({
+                att_product_id: r.att_product_id,
+                prod_name: r.prod_name,
+                attempts: Number(r.attempts),
+                best_score: r.best_score === null ? null : Number(r.best_score),
+                avg_score: r.avg_score === null ? null : Number(r.avg_score),
+                latest_score: r.latest_score === null ? null : Number(r.latest_score),
+                last_attempt_at: r.last_attempt_at,
+                // สองค่านี้เป็น null ถ้าชุดนั้นไม่ใช้ระบบคะแนน — ฝั่งหน้าเว็บจะโชว์เป็น % อย่างเดียว
+                best_earned_score: r.best_earned_score === null ? null : Number(r.best_earned_score),
+                max_score: r.max_score === null ? null : Number(r.max_score),
+                // เรียงหมวดที่แม่นน้อยสุดขึ้นก่อน — ว่างได้ถ้าชุดนั้นยังตอบไม่ถึงเกณฑ์ขั้นต่ำต่อหมวด
+                weak_topics: topicsByProduct[r.att_product_id] ?? [],
+                mistake_count: mistakesByProduct[r.att_product_id] ?? 0,
+            })),
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
+// "ข้อที่ต้องทบทวน" — ข้อที่ลูกค้าเคยตอบผิด รวมทุกครั้งที่ทำ
+//
+// นี่คือจุดที่เปลี่ยนหน้าประวัติจาก "รายงานผล" เป็น "เครื่องมือฝึก" — เดิมบอกได้แค่ว่าอ่อนหมวดไหน
+// แต่ไม่มีทางกดไปดูว่าผิดข้อไหนบ้าง ทั้งที่จุดขายของธุรกิจคือเฉลยที่อธิบายวิธีคิด (CLAUDE.md ข้อ 4)
+//
+// เรียงตาม "ยังผิดอยู่" ก่อน แล้วค่อยตามจำนวนครั้งที่ผิด — ข้อที่เคยผิดแต่ครั้งล่าสุดตอบถูกแล้วถือว่า
+// แก้ได้แล้ว ดันลงไปท้ายลิสต์ ส่วนข้อที่ผิดซ้ำหลายครั้งคือสัญญาณชัดที่สุดว่ายังไม่เข้าใจจริง
+//
+// คืนเฉลยเต็ม (ตัวเลือกถูก + วิธีคิด + เหตุผลที่ตัวเลือกอื่นผิด) เหมือน bookmark — เป็นข้อที่ทำไปแล้ว
+// การเปิดเฉลยจึงไม่กระทบความยุติธรรมของการสอบ
+async function getMistakes(req, res, next) {
+    try {
+        const customerId = req.customer.cus_id;
+        const limit = Math.min(Number(req.query.limit) || 20, 100);
+        const offset = Number(req.query.offset) || 0;
+        const productId = req.query.product_id || null;
+        const topicId = req.query.topic_id || null;
+        // ค่าเริ่มต้นโชว์เฉพาะข้อที่ "ยังผิดอยู่" เพราะเป็นสิ่งที่ต้องลงมือทบทวนจริงๆ
+        const includeResolved = req.query.include_resolved === "1";
+
+        const conditions = [
+            "att.att_customer_id = ?",
+            "att.att_status = 'submitted'",
+            "a.ans_is_correct IS NOT NULL",
+        ];
+        const params = [customerId];
+        if (productId) { conditions.push("q.ques_product_id = ?"); params.push(productId); }
+        if (topicId) { conditions.push("q.ques_topic_id = ?"); params.push(topicId); }
+
+        // รวมสถิติรายข้อก่อน แล้วค่อยกรองเอาเฉพาะข้อที่เคยผิด — ต้องรู้จำนวนครั้งที่ตอบทั้งหมดด้วย
+        // ไม่งั้นแยกไม่ออกระหว่าง "ผิด 1 จาก 1" กับ "ผิด 1 จาก 5" ซึ่งความหมายต่างกันมาก
+        const havingSql = includeResolved ? "HAVING wrong_count > 0" : UNRESOLVED_MISTAKE_HAVING;
+        const [rows] = await pool.query(
+            `SELECT * FROM (
+                SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url,
+                       q.ques_product_id, p.prod_name, t.tpc_id, t.tpc_name,
+                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                       COUNT(*) AS answered_count,
+                       MAX(att.att_submitted_at) AS last_answered_at,
+                       -- ผลของ "ครั้งล่าสุด" ที่ตอบข้อนี้ (ไม่ใช่ครั้งไหนก็ได้) ใช้ตัดสินว่าแก้ได้แล้วหรือยัง
+                       ${LATEST_CORRECT_SQL} AS latest_correct,
+                       SUBSTRING_INDEX(GROUP_CONCAT(COALESCE(a.ans_selected_choice_id, '') ORDER BY att.att_submitted_at DESC), ',', 1) AS latest_choice_id
+                FROM tb_attempt_answers a
+                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+                JOIN tb_questions q ON q.ques_id = a.ans_question_id
+                JOIN tb_products p ON p.prod_id = q.ques_product_id
+                LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
+                WHERE ${conditions.join(" AND ")}
+                GROUP BY q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url,
+                         q.ques_product_id, p.prod_name, t.tpc_id, t.tpc_name
+                ${havingSql}
+             ) m
+             -- ques_id ปิดท้ายเพื่อให้ลำดับ "เต็ม" (total order) ขาดไม่ได้ — สามคีย์แรกเสมอกันได้ง่ายมาก
+             -- (ข้อที่ผิดครั้งเดียวจาก attempt เดียวกันมี last_answered_at เท่ากันเป๊ะทุกข้อ) พอเสมอกัน
+             -- MySQL จัดลำดับกันเองอิสระในแต่ละ query ข้อเดียวกันจึงโผล่ทั้งหน้า 1 และหน้า 2 ได้
+             -- (เจอจริงตอนทดสอบ: หน้า 1 กับ 2 ซ้ำกัน 1 ข้อ)
+             ORDER BY m.latest_correct ASC, m.wrong_count DESC, m.last_answered_at DESC, m.ques_id ASC
+             LIMIT ? OFFSET ?`,
+            [...params, limit, offset]
+        );
+
+        const [[{ total }]] = await pool.query(
+            `SELECT COUNT(*) AS total FROM (
+                SELECT q.ques_id,
+                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                       ${LATEST_CORRECT_SQL} AS latest_correct
+                FROM tb_attempt_answers a
+                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+                JOIN tb_questions q ON q.ques_id = a.ans_question_id
+                WHERE ${conditions.join(" AND ")}
+                GROUP BY q.ques_id
+                ${havingSql}
+             ) c`,
+            params
+        );
+
+        if (rows.length === 0) return res.json({ data: [], total: 0 });
+
+        const [choices] = await pool.query(
+            `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url
+             FROM tb_choices WHERE cho_question_id IN (?) ORDER BY cho_order ASC`,
+            [rows.map((r) => r.ques_id)]
+        );
+        const choicesByQuestion = {};
+        for (const c of choices) (choicesByQuestion[c.cho_question_id] ??= []).push(c);
+
+        // สถานะ bookmark ของข้อพวกนี้ — ปุ่มบันทึกต้องรู้สถานะจริงตั้งแต่ render แรก ไม่งั้นข้อที่บันทึกไว้
+        // แล้วจะโชว์เป็น "ยังไม่บันทึก" แล้วกดครั้งแรกกลายเป็นการลบทิ้งโดยที่ผู้ใช้ตั้งใจจะบันทึก
+        const [bookmarked] = await pool.query(
+            "SELECT bmk_question_id FROM tb_bookmarks WHERE bmk_customer_id = ? AND bmk_question_id IN (?)",
+            [customerId, rows.map((r) => r.ques_id)]
+        );
+        const bookmarkedSet = new Set(bookmarked.map((b) => b.bmk_question_id));
+
+        res.json({
+            total: Number(total),
+            data: rows.map((r) => ({
+                ques_id: r.ques_id,
+                ques_text: r.ques_text,
+                ques_explanation: r.ques_explanation,
+                ques_image_url: r.ques_image_url,
+                prod_id: r.ques_product_id,
+                prod_name: r.prod_name,
+                tpc_id: r.tpc_id,
+                tpc_name: r.tpc_name,
+                wrong_count: Number(r.wrong_count),
+                answered_count: Number(r.answered_count),
+                last_answered_at: r.last_answered_at,
+                // ครั้งล่าสุดตอบถูกแล้ว = เคยพลาดแต่แก้ได้แล้ว
+                resolved: Number(r.latest_correct) === 1,
+                latest_choice_id: r.latest_choice_id || null,
+                is_bookmarked: bookmarkedSet.has(r.ques_id),
+                choices: (choicesByQuestion[r.ques_id] ?? []).map((c) => ({
+                    cho_id: c.cho_id,
+                    cho_text: c.cho_text,
+                    cho_image_url: c.cho_image_url,
+                    is_correct: !!c.cho_is_correct,
+                    wrong_reason: c.cho_is_correct ? null : c.cho_wrong_reason,
+                })),
+            })),
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
 // สรุปจุดอ่อนรายหมวด — group ตาม topic (ไม่ใช่ category เพราะ "อนุกรม"/"อุปมาอุปไมย" ถูกแท็กที่ระดับ
 // คำถามผ่าน ques_topic_id) นับเฉพาะ attempt ที่ submitted แล้ว และต้องตอบอย่างน้อย MIN_SAMPLE ข้อ
 // ต่อหมวดถึงจะโชว์ กัน % ดูน่าเชื่อถือผิดๆ จากตัวอย่างน้อยเกินไป (เช่น ทำข้อเดียวแล้วผิด = 0%)
@@ -507,18 +751,83 @@ async function getWeakAreas(req, res, next) {
     }
 }
 
+// ประวัติการทำข้อสอบ — แบ่งหน้าเสมอ
+//
+// เดิมดึงทุก attempt ของลูกค้ามาทั้งก้อนโดยไม่มี LIMIT เลย ลูกค้าที่ซ้อมทุกวันจะสะสมหลักร้อยครั้งภายใน
+// เดือนเดียว แล้วหน้านี้จะช้าลงเรื่อยๆ แบบไม่มีเพดาน ทั้งที่ไม่มีใครเลื่อนไปดูครั้งที่ 80
+//
+// status: กรองได้ (submitted/in_progress/abandoned) — ของจริงตอนนี้ attempt ที่ถูกยกเลิกมีมากกว่าที่ทำเสร็จ
+// เกือบเท่าตัว ถ้าปนกันหมดหน้าจะดูเหมือนประวัติที่ล้มเหลวมากกว่าสำเร็จ
+//
+// attempt_no / prev_score: ลำดับครั้งที่ทำชุดนั้น + คะแนนครั้งก่อนของชุดเดียวกัน ใช้บอกว่า "ดีขึ้นหรือแย่ลง"
+// ต้องคำนวณด้วย window function บนข้อมูลทั้งหมดก่อนตัดหน้า ไม่งั้นเลขครั้งที่จะเพี้ยนตามหน้าที่เปิดอยู่
 async function getAttemptHistory(req, res, next) {
     try {
+        const limit = Math.min(Number(req.query.limit) || 20, 100);
+        const offset = Number(req.query.offset) || 0;
+        const status = ["submitted", "in_progress", "abandoned"].includes(req.query.status) ? req.query.status : null;
+
+        const conditions = ["a.att_customer_id = ?"];
+        const params = [req.customer.cus_id];
+        if (status) { conditions.push("a.att_status = ?"); params.push(status); }
+        const whereClause = conditions.join(" AND ");
+
         const [rows] = await pool.query(
-            `SELECT a.att_id, a.att_product_id, p.prod_name, a.att_mode, a.att_status,
-                    a.att_score, a.att_earned_score, a.att_max_score, a.att_total_questions,
-                    a.att_started_at, a.att_submitted_at
-             FROM tb_attempts a JOIN tb_products p ON p.prod_id = a.att_product_id
-             WHERE a.att_customer_id = ?
-             ORDER BY a.att_started_at DESC`,
+            `SELECT * FROM (
+                SELECT a.att_id, a.att_product_id, p.prod_name, a.att_mode, a.att_status,
+                       a.att_score, a.att_earned_score, a.att_max_score, a.att_total_questions,
+                       a.att_time_limit_minutes, a.att_started_at, a.att_submitted_at,
+                       ROW_NUMBER() OVER (PARTITION BY a.att_product_id ORDER BY a.att_started_at ASC) AS attempt_no,
+                       -- คะแนนของครั้งก่อนหน้า "ที่ส่งคำตอบแล้ว" ของชุดเดียวกัน — ใช้ subquery แทน LAG()
+                       -- เพราะ LAG จะหยิบแถวที่ติดกันมาตรงๆ ถ้าครั้งก่อนหน้าเป็น attempt ที่ยกเลิก/ทำค้าง
+                       -- (att_score เป็น NULL) การเทียบ "ดีขึ้น/แย่ลง" จะหายไปทั้งที่มีคะแนนเก่าให้เทียบอยู่
+                       -- MySQL ไม่รองรับ LAG(...) IGNORE NULLS จึงต้องเขียนแบบนี้
+                       (SELECT b.att_score FROM tb_attempts b
+                         WHERE b.att_customer_id = a.att_customer_id
+                           AND b.att_product_id = a.att_product_id
+                           AND b.att_status = 'submitted'
+                           AND b.att_started_at < a.att_started_at
+                         ORDER BY b.att_started_at DESC LIMIT 1) AS prev_score
+                FROM tb_attempts a JOIN tb_products p ON p.prod_id = a.att_product_id
+                WHERE ${whereClause}
+             ) t
+             ORDER BY t.att_started_at DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limit, offset]
+        );
+
+        // เงื่อนไขใช้แต่ alias a อยู่แล้ว จึงนับได้โดยไม่ต้อง join tb_products มาด้วย
+        const [[{ total }]] = await pool.query(
+            `SELECT COUNT(*) AS total FROM tb_attempts a WHERE ${whereClause}`,
+            params
+        );
+
+        // สรุปภาพรวมคิดจาก attempt ที่ "ส่งคำตอบแล้ว" ทั้งหมดเสมอ ไม่ใช่เฉพาะหน้าที่เปิดอยู่ —
+        // ไม่งั้นค่าเฉลี่ยจะเปลี่ยนไปมาตามหน้าที่กดดู ซึ่งไม่มีความหมายอะไรเลย
+        const [[summary]] = await pool.query(
+            `SELECT COUNT(*) AS submitted_count,
+                    ROUND(AVG(att_score), 1) AS avg_score,
+                    MAX(att_submitted_at) AS last_submitted_at
+             FROM tb_attempts WHERE att_customer_id = ? AND att_status = 'submitted'`,
             [req.customer.cus_id]
         );
-        res.json({ data: rows });
+        const [[latest]] = await pool.query(
+            `SELECT att_score FROM tb_attempts
+             WHERE att_customer_id = ? AND att_status = 'submitted'
+             ORDER BY att_submitted_at DESC LIMIT 1`,
+            [req.customer.cus_id]
+        );
+
+        res.json({
+            data: rows,
+            total: Number(total),
+            summary: {
+                submitted_count: Number(summary.submitted_count),
+                avg_score: summary.avg_score === null ? null : Number(summary.avg_score),
+                latest_score: latest ? Number(latest.att_score) : null,
+                last_submitted_at: summary.last_submitted_at,
+            },
+        });
     } catch (err) {
         next(err);
     }
@@ -563,6 +872,7 @@ async function exportPrintableQuestions(req, res, next) {
 }
 
 module.exports = {
-    startOrResumeAttempt, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory, getWeakAreas,
+    startOrResumeAttempt, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory,
+    getProductSummary, getWeakAreas, getMistakes,
     fetchQuestionsWithChoices, fetchSampleQuestions, buildQuestionPayload, exportPrintableQuestions,
 };

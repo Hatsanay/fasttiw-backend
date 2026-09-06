@@ -99,7 +99,10 @@ router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.get
 router.post("/V1/store/products/:id/attempts", requireCustomerAuth, attemptController.startOrResumeAttempt);
 router.get("/V1/store/products/:id/export-questions", requireCustomerAuth, attemptController.exportPrintableQuestions);
 router.get("/V1/store/attempts", requireCustomerAuth, attemptController.getAttemptHistory);
+// ต้องประกาศก่อน "/V1/store/attempts/:id" เสมอ ไม่งั้น "summary" จะถูกจับเป็น :id
+router.get("/V1/store/attempts/summary", requireCustomerAuth, attemptController.getProductSummary);
 router.get("/V1/store/me/weak-areas", requireCustomerAuth, attemptController.getWeakAreas);
+router.get("/V1/store/me/mistakes", requireCustomerAuth, attemptController.getMistakes);
 router.get("/V1/store/attempts/:id", requireCustomerAuth, attemptController.getAttempt);
 router.put("/V1/store/attempts/:id/answers/:questionId", requireCustomerAuth, attemptController.submitAnswer);
 router.post("/V1/store/attempts/:id/submit", requireCustomerAuth, attemptController.submitAttempt);
