@@ -70,6 +70,12 @@ const PERMISSION_KEYS = [
     "deleteNews",
     // กลุ่มใหม่ต้องต่อท้ายเสมอ (ห้ามแทรกกลาง) เพราะตำแหน่ง bit ผูกกับ role_permission ที่บันทึกไว้ใน DB แล้ว
     "chatManagement",
+    // กลุ่มใหม่ต้องต่อท้ายเสมอ (ห้ามแทรกกลาง) เพราะตำแหน่ง bit ผูกกับ role_permission ที่บันทึกไว้ใน DB แล้ว
+    "entitlementsManagement",
+    "grantEntitlement",
+    "revokeEntitlement",
+    "refundEntitlement",
+    "editEntitlement",
 ];
 
 const BIT_INDEX = Object.fromEntries(PERMISSION_KEYS.map((key, i) => [key, i]));

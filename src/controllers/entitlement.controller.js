@@ -3,6 +3,7 @@ const { generateId, generateIds } = require("../utils/generateId");
 const { findValidCoupon, incrementUsage } = require("./coupon.controller");
 const { getEffectivePrice } = require("../utils/pricing");
 const stripeClient = require("../utils/stripeClient");
+const { hasBit } = require("../utils/permissions");
 
 // grantProduct — จุดเดียวที่ให้สิทธิ์เข้าถึง product กับ customer (ตาม CLAUDE.md ข้อ 2)
 // ทุกช่องทางขาย (manual/payment/renewal) ต้องเรียกผ่านฟังก์ชันนี้เท่านั้น ไม่ insert tb_entitlements ตรงๆ ที่อื่น
@@ -207,6 +208,14 @@ async function createBatch(req, res, next) {
     try {
         const { product_ids, package_id, duration_months, coupon_code } = req.body ?? {};
 
+        // คิดเงินหรือไม่ — ค่าเริ่มต้นคือคิดเงิน (พฤติกรรมเดิมก่อนมีตัวเลือกนี้) ต้องส่ง charge: false มาชัดเจน
+        // เท่านั้นถึงจะเป็นการแจกฟรี กันเผลอไม่บันทึกยอดขายเพราะ client ลืมส่งฟิลด์
+        //
+        // แจกฟรี = ไม่บันทึกยอดขายเลย (ไม่มีแถวใน tb_sales/tb_sale_items ไม่มีค่าคอม) ใช้กับเคสอย่าง
+        // ให้รีวิวเวอร์ลอง / ชดเชยลูกค้าที่เจอปัญหา / บัญชีทดสอบ — ถ้าบันทึกเป็นยอดขายจะทำให้รายได้และ
+        // ส่วนแบ่งหุ้นส่วนสูงกว่าความจริงทั้งที่ไม่เคยมีเงินเข้าเลย
+        const shouldCharge = req.body?.charge !== false;
+
         // แพ็กเกจถูก "ขยาย" เป็นรายการ product ย่อยตรงนี้เลย แล้วไหลผ่าน flow เดิมทั้งหมดเหมือนให้สิทธิ์
         // รายชิ้น — ตรงกับหลักการใน CLAUDE.md ข้อ 2 ที่ว่าสิทธิ์ผูกกับ product เสมอ ไม่ใช่ package
         // (วิธีเดียวกับ checkout() ใน store.controller.js เป๊ะ ต่างกันแค่ที่นี่ไม่ผ่านการชำระเงิน)
@@ -241,6 +250,11 @@ async function createBatch(req, res, next) {
         // โค้ดทิ้งค่านั้นไปเฉยๆ แล้วยัง recordSale() ด้วยส่วนลดของคูปองเหมือนเดิม กลายเป็นบันทึกรายได้ต่ำกว่า
         // ความจริงสำหรับการขายที่ไม่ควรได้ส่วนลดแล้ว — ย้าย claim มาก่อน reject ทันทีถ้าชนโควตา กันไม่ให้มีการ
         // grant สิทธิ์/บันทึกยอดขายอะไรเกิดขึ้นเลยถ้าโควตาคูปองหมดไปแล้วจริงๆ ณ ตอนนั้น
+        // ไม่คิดเงินแล้วยังใส่คูปองมาด้วย = ขัดกันเอง และจะเผาโควตาคูปองทิ้งฟรีโดยไม่มีการขายเกิดขึ้นจริง
+        if (!shouldCharge && coupon_code) {
+            return res.status(400).json({ message: "เลือกไม่คิดเงินแล้วใช้โค้ดส่วนลดพร้อมกันไม่ได้" });
+        }
+
         let coupon = null;
         if (coupon_code) {
             const result = await findValidCoupon(coupon_code);
@@ -284,14 +298,18 @@ async function createBatch(req, res, next) {
             discountOverride = subtotal - Number(pkg.pkg_price);
         }
 
-        const saleId = await recordSale(req.params.id, productIds, coupon, req.user.user_id, 0, discountOverride, pkg?.pkg_id ?? null);
-        await linkEntitlementsToSale(saleId, entIdByProduct, expiresBefore);
+        // แจกฟรีจะไม่มีรายการขายให้ผูก ent_sale_item_id จึงเป็น NULL — ตอนยกเลิกทีหลังจะเลือกได้แค่
+        // "ยกเลิกเฉยๆ" ซึ่งถูกต้องแล้ว เพราะไม่มียอดอะไรให้หักออก
+        if (shouldCharge) {
+            const saleId = await recordSale(req.params.id, productIds, coupon, req.user.user_id, 0, discountOverride, pkg?.pkg_id ?? null);
+            await linkEntitlementsToSale(saleId, entIdByProduct, expiresBefore);
+        }
 
+        const what = pkg ? "ให้สิทธิ์จากแพ็กเกจสำเร็จ" : "ให้สิทธิ์สำเร็จ";
         res.status(201).json({
-            message: pkg
-                ? `ให้สิทธิ์จากแพ็กเกจสำเร็จ ${productIds.length} ชุด`
-                : `ให้สิทธิ์สำเร็จ ${productIds.length} ชุด`,
+            message: `${what} ${productIds.length} ชุด${shouldCharge ? "" : " (ไม่คิดเงิน ไม่บันทึกยอดขาย)"}`,
             granted: productIds.length,
+            charged: shouldCharge,
         });
     } catch (err) {
         if (err.code === "ER_NO_REFERENCED_ROW_2" || err.code === "ER_NO_REFERENCED_ROW") {
@@ -471,9 +489,20 @@ async function revoke(req, res, next) {
         if (ent.ent_status !== "active") return res.status(400).json({ message: "สิทธิ์นี้ถูกยกเลิกไปแล้ว" });
 
         const shouldReverse = REASONS_THAT_REVERSE_REVENUE.includes(reason);
+
+        // การหักยอดขาย/คืนเงินเป็นคนละสิทธิ์กับการยกเลิกสิทธิ์เฉยๆ — เช็คแยกตรงนี้ ไม่ใช่ที่ชั้น route
+        // เพราะเป็น endpoint เดียวกัน ต่างกันแค่ค่า reason ที่ส่งมา (คนที่ยกเลิกสิทธิ์ได้ ไม่จำเป็นต้อง
+        // มีสิทธิ์แตะเงินของธุรกิจด้วย)
+        if (shouldReverse) {
+            const [roleRows] = await pool.query("SELECT role_permission FROM tb_roles WHERE role_id = ?", [req.user?.user_role_id]);
+            if (!hasBit(roleRows[0]?.role_permission ?? "", "refundEntitlement")) {
+                return res.status(403).json({ message: "ไม่มีสิทธิ์ยกเลิกแบบหักยอดขาย/คืนเงิน" });
+            }
+        }
+
         if (shouldReverse && !ent.si_id) {
             return res.status(400).json({
-                message: "สิทธิ์นี้ไม่ได้ผูกกับรายการขายใดในระบบ (ให้ไว้ก่อนมีระบบบันทึกการขาย) จึงหักยอดออกอัตโนมัติไม่ได้ — เลือกยกเลิกเฉยๆ แทน",
+                message: "สิทธิ์นี้ไม่มีรายการขายผูกอยู่ (แจกฟรี หรือให้ไว้ก่อนระบบเริ่มบันทึกการขาย) จึงไม่มียอดอะไรให้หักออก — เลือกยกเลิกเฉยๆ แทน",
             });
         }
 

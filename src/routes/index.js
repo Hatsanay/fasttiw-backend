@@ -247,13 +247,13 @@ router.delete("/V1/customers/:id", requireAuth, requirePermission("deleteCustome
 router.get(
     "/V1/customers/:id/entitlements",
     requireAuth,
-    requirePermission("customersManagement"),
+    requirePermission("entitlementsManagement"),
     entitlementController.getByCustomer
 );
 router.post(
     "/V1/customers/:id/entitlements",
     requireAuth,
-    requirePermission("createCustomer"),
+    requirePermission("grantEntitlement"),
     entitlementController.createBatch
 );
 // ภาพรวมสิทธิ์ทั้งหมด (ทุกลูกค้า) — ใช้ requirePermission("customersManagement") เหมือนหน้าลูกค้า
@@ -261,25 +261,25 @@ router.post(
 router.get(
     "/V1/entitlements",
     requireAuth,
-    requirePermission("customersManagement"),
+    requirePermission("entitlementsManagement"),
     entitlementController.getAll
 );
 router.put(
     "/V1/entitlements/:id/revoke",
     requireAuth,
-    requirePermission("editCustomer"),
+    requirePermission("revokeEntitlement"),
     entitlementController.revoke
 );
 router.put(
     "/V1/entitlements/:id/restore",
     requireAuth,
-    requirePermission("editCustomer"),
+    requirePermission("editEntitlement"),
     entitlementController.restore
 );
 router.put(
     "/V1/entitlements/:id/expiry",
     requireAuth,
-    requirePermission("editCustomer"),
+    requirePermission("editEntitlement"),
     entitlementController.updateExpiry
 );
 
