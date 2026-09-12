@@ -26,6 +26,7 @@ const newsController = require("../controllers/news.controller");
 const chatController = require("../controllers/chat.controller");
 const { requireAuth } = require("../middlewares/auth.middleware");
 const { requirePermission } = require("../middlewares/permission.middleware");
+const visitController = require("../controllers/visit.controller");
 const { uploadImage, uploadSpreadsheet } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
 
@@ -318,6 +319,10 @@ router.get("/V1/expenses/:id", requireAuth, requirePermission("expensesManagemen
 router.post("/V1/expenses", requireAuth, requirePermission("createExpense"), expenseController.create);
 router.put("/V1/expenses/:id", requireAuth, requirePermission("editExpense"), expenseController.update);
 router.delete("/V1/expenses/:id", requireAuth, requirePermission("deleteExpense"), expenseController.remove);
+
+// ─── สถิติผู้เยี่ยมชมเว็บฝั่งลูกค้า (หน้า /visitors) ─────────────────────────────────────
+router.get("/V1/visitors/overview", requireAuth, requirePermission("visitorStats"), visitController.getOverview);
+router.get("/V1/visitors/online", requireAuth, requirePermission("visitorStats"), visitController.getOnline);
 
 // ─── reports (รายงานการเงิน) ──────────────────────────────────────────────────────
 router.get("/V1/reports/summary", requireAuth, requirePermission("reportsManagement"), reportController.summary);

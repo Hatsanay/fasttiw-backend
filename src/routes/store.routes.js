@@ -1,5 +1,6 @@
 const express = require("express");
 const customerAuthController = require("../controllers/customerAuth.controller");
+const visitController = require("../controllers/visit.controller");
 const storeController = require("../controllers/store.controller");
 const attemptController = require("../controllers/attempt.controller");
 const bookmarkController = require("../controllers/bookmark.controller");
@@ -20,6 +21,9 @@ const router = express.Router();
 // ตัวเลขตั้งให้ "หลวมพอสำหรับคนใช้จริงที่พิมพ์ผิดหลายรอบ แต่แน่นพอที่จะทำให้การไล่ยิงอัตโนมัติไม่คุ้ม"
 // — ลิมิตรายบัญชีที่มีอยู่แล้ว (forgot-password 3 ครั้ง/ชม./บัญชี) ยังทำงานคู่กันไป คนละมิติกัน:
 // อันนั้นกันสแปมกล่องเมลของเหยื่อ ส่วนอันนี้กันคนกวาดยิงหลายบัญชีจากเครื่องเดียว
+// ตัวนับผู้เยี่ยมชม — หลวมมากโดยตั้งใจ: ห้องเรียน/ออฟฟิศที่ใช้ IP เดียวกันหลายสิบคนต้องไม่ถูกตัด
+// แค่กันสคริปต์ยิงรัวๆ ยัดยอดวิวปลอมลงตาราง (คนจริง 1 คนส่งแค่ครั้งละหน้า + สัญญาณทุก 1 นาที)
+const trackLimiter = rateLimit({ name: "track", windowMs: 60 * 1000, max: 300, message: " " });
 const loginLimiter = rateLimit({
     name: "login", windowMs: 15 * 60 * 1000, max: 20,
     message: "พยายามเข้าสู่ระบบถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
@@ -48,6 +52,11 @@ const registerOtpLimiter = rateLimit({
 router.post("/V1/store/auth/register/request-otp", registerOtpLimiter, customerAuthController.requestRegisterOtp);
 router.post("/V1/store/auth/register", registerLimiter, customerAuthController.register);
 router.post("/V1/store/auth/login", loginLimiter, customerAuthController.login);
+// สถิติผู้เยี่ยมชม — สาธารณะ ไม่ต้อง login (นับทุกคนที่เข้าเว็บ) ดู controllers/visit.controller.js
+router.post("/V1/store/track", trackLimiter, visitController.track);
+// เข้าสู่ระบบด้วย Google — ใช้ลิมิตเดียวกับ login/register (ยิงแลก code ถี่ๆ = เปลืองโควตาของ Google client เรา)
+router.post("/V1/store/auth/google", loginLimiter, customerAuthController.googleLogin);
+router.post("/V1/store/auth/google/complete", registerLimiter, customerAuthController.googleSignupComplete);
 router.post("/V1/store/auth/logout", requireCustomerAuth, customerAuthController.logout);
 // ลืมรหัสผ่าน — ไม่ต้อง auth (คนที่เข้าระบบไม่ได้อยู่แล้วเป็นคนเรียก) ป้องกันหลายชั้น: จำกัดต่อ IP ที่นี่,
 // จำกัด 3 ครั้ง/ชม./บัญชีใน controller, token ใช้ได้ครั้งเดียวและหมดอายุใน 60 นาที
@@ -55,6 +64,7 @@ router.post("/V1/store/auth/forgot-password", forgotLimiter, customerAuthControl
 router.post("/V1/store/auth/reset-password", resetLimiter, customerAuthController.resetPassword);
 router.get("/V1/store/me", requireCustomerAuth, customerAuthController.getMe);
 router.put("/V1/store/me", requireCustomerAuth, customerAuthController.updateMyProfile);
+router.put("/V1/store/me/name", requireCustomerAuth, customerAuthController.updateMyName);
 router.put("/V1/store/me/password", requireCustomerAuth, customerAuthController.changeMyPassword);
 router.put("/V1/store/me/onboarding", requireCustomerAuth, customerAuthController.completeOnboarding);
 router.put("/V1/store/me/image", requireCustomerAuth, uploadImage.single("image"), customerAuthController.uploadMyImage);

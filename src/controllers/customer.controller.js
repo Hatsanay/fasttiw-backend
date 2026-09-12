@@ -64,8 +64,8 @@ async function create(req, res, next) {
 
         await pool.query(
             `INSERT INTO tb_customers
-                (cus_id, cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                (cus_id, cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone, cus_signup_via)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'admin')`,
             [cus_id, cus_id, cus_email || null, passwordHash, cus_fname || null, cus_lname || null, cus_phone || null]
         );
 

@@ -4,6 +4,7 @@ const sharp = require("sharp");
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { resolveUploadPath } = require("../utils/uploads");
+const { notifyNewChatMessage } = require("../utils/telegramNotify");
 
 const CHAT_ATTACHMENT_DIR = path.join(__dirname, "..", "..", "uploads", "chat-attachments");
 
@@ -195,6 +196,38 @@ async function insertMessage({ convId, senderType, staffId, text, files }) {
     return { ...row, msg_image_urls: parseJsonColumn(row.msg_image_urls) };
 }
 
+// เตรียมข้อมูลแจ้งเตือน Telegram ของข้อความลูกค้า — กติกาว่าจะแจ้งหรือเงียบอยู่ที่ utils/telegramNotify.js
+// ทั้งฟังก์ชันไม่ throw และไม่ต้อง await (ผู้เรียกตอบลูกค้าไปแล้วก่อนเรียกตัวนี้)
+function queueTelegramNotification(conv, message) {
+    (async () => {
+        const [[info]] = await pool.query(
+            `SELECT c.conv_unread_count, c.conv_customer_id, c.conv_guest_id, cus.cus_fname, cus.cus_lname, cus.cus_username,
+                    (SELECT MAX(m.msg_created_at) FROM tb_chat_messages m
+                      WHERE m.msg_conv_id = c.conv_id AND m.msg_sender_type = 'staff') AS last_staff_reply_at
+             FROM tb_chat_conversations c
+             LEFT JOIN tb_customers cus ON cus.cus_id = c.conv_customer_id
+             WHERE c.conv_id = ?`,
+            [conv.conv_id]
+        );
+        if (!info) return;
+        const isCustomer = !!info.conv_customer_id;
+        // ป้ายชื่อแบบเดียวกับรายการแชทในหน้าแอดมิน (listConversations) — แอดมินจำคนเดียวกันได้ทั้งสองที่
+        const senderLabel = isCustomer
+            ? `${info.cus_fname ?? ""} ${info.cus_lname ?? ""}`.trim() || info.cus_username || info.conv_customer_id
+            : `ผู้เยี่ยมชม #${info.conv_guest_id?.slice(0, 8) ?? "?"}`;
+        await notifyNewChatMessage({
+            convId: conv.conv_id,
+            senderLabel,
+            isCustomer,
+            text: message.msg_text,
+            imageCount: message.msg_image_urls?.length ?? 0,
+            unreadCount: Number(info.conv_unread_count),
+            lastStaffReplyAt: info.last_staff_reply_at,
+            sentAt: message.msg_created_at,
+        });
+    })().catch((err) => console.error("[telegram] เตรียมข้อมูลแจ้งเตือนไม่สำเร็จ:", err.message));
+}
+
 // POST /store/chat/conversation/:convId/messages — ฝั่งลูกค้าส่งข้อความ (multipart: text ไม่บังคับ, images
 // แนบได้หลายไฟล์ ไม่บังคับ)
 async function sendMyMessage(req, res, next) {
@@ -206,6 +239,8 @@ async function sendMyMessage(req, res, next) {
 
         const message = await insertMessage({ convId, senderType: "visitor", text: req.body.text, files: req.files });
         res.status(201).json({ message });
+        // แจ้งแอดมินทาง Telegram "หลัง" ตอบลูกค้าไปแล้ว และไม่ await — Telegram ช้า/ล่มต้องไม่กระทบแชทเลย
+        queueTelegramNotification(conv, message);
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
         next(err);

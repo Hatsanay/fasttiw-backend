@@ -7,6 +7,7 @@ const { saveAvatarForCustomer } = require("./customer.controller");
 const { createSession, listSessions, revokeSession, revokeSessionByJti, revokeAllSessions } = require("../utils/customerSession");
 const { sendMail } = require("../utils/mailer");
 const { buildPasswordResetEmail, buildRegisterOtpEmail } = require("../utils/emailTemplates");
+const { exchangeCodeForProfile, signSignupToken, verifySignupToken } = require("../utils/googleAuth");
 
 const RESET_TOKEN_TTL_MINUTES = 60;
 const RESET_MAX_REQUESTS_PER_HOUR = 3; // ต่อ 1 บัญชี — กันคนกดรัวจนเมลของลูกค้าเต็มและกันเปลืองโควตา SMTP
@@ -131,8 +132,8 @@ async function register(req, res, next) {
         await pool.query(
             `INSERT INTO tb_customers
                 (cus_id, cus_username, cus_email, cus_password, cus_fname, cus_lname, cus_phone,
-                 cus_must_change_password, cus_pdpa_consented_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, NOW())`,
+                 cus_must_change_password, cus_pdpa_consented_at, cus_signup_via)
+             VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, NOW(), 'web')`,
             [cus_id, cus_username, email, passwordHash, cus_fname || null, cus_lname || null, cus_phone || null]
         );
 
@@ -175,16 +176,145 @@ async function login(req, res, next) {
             return res.status(401).json({ message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
         }
 
-        await pool.query("UPDATE tb_customers SET cus_last_login_at = NOW() WHERE cus_id = ?", [customer.cus_id]);
-
-        // mcp (must_change_password) ฝังไว้ใน token เลย — ฝั่ง frontend อ่านได้โดยไม่ต้องยิง API
-        // เพิ่ม (ตาม pattern optimistic check เดียวกับที่ proxy.ts ใช้) พอทำ onboarding เสร็จค่อยออก
-        // token ใหม่ให้ (ดู completeOnboarding ด้านล่าง)
-        // login ใหม่แต่ละครั้ง = อุปกรณ์ใหม่ 1 slot (จำกัดพร้อมกันได้ 2 เครื่อง เกินโควตาเตะเครื่องเก่าสุดออก)
-        const jti = await createSession(customer.cus_id, req.headers["user-agent"]);
-        const token = signToken({ cus_id: customer.cus_id, mcp: !!customer.cus_must_change_password, jti });
-        res.json({ token });
+        res.json({ token: await issueLoginToken(customer, req.headers["user-agent"]) });
     } catch (err) {
+        next(err);
+    }
+}
+
+// ออก token ล็อกอินให้บัญชีที่ยืนยันตัวตนผ่านแล้ว — จุดกลางเดียวของทั้งรหัสผ่านและ Google
+// ให้ทุกทางได้ session/อุปกรณ์/last_login แบบเดียวกันเป๊ะ ไม่มีทางไหนหลุดโควตา 2 อุปกรณ์
+//
+// mcp (must_change_password) ฝังไว้ใน token เลย — ฝั่ง frontend อ่านได้โดยไม่ต้องยิง API
+// เพิ่ม (ตาม pattern optimistic check เดียวกับที่ proxy.ts ใช้) พอทำ onboarding เสร็จค่อยออก
+// token ใหม่ให้ (ดู completeOnboarding ด้านล่าง)
+// login ใหม่แต่ละครั้ง = อุปกรณ์ใหม่ 1 slot (จำกัดพร้อมกันได้ 2 เครื่อง เกินโควตาเตะเครื่องเก่าสุดออก)
+async function issueLoginToken(customer, userAgent) {
+    await pool.query("UPDATE tb_customers SET cus_last_login_at = NOW() WHERE cus_id = ?", [customer.cus_id]);
+    const jti = await createSession(customer.cus_id, userAgent);
+    return signToken({ cus_id: customer.cus_id, mcp: !!customer.cus_must_change_password, jti });
+}
+
+/* ─────────────────── เข้าสู่ระบบด้วย Google ─────────────────── */
+
+const CUSTOMER_LOGIN_COLUMNS = "cus_id, cus_status, cus_must_change_password, cus_google_sub";
+
+// หาบัญชีที่ตรงกับบัญชี Google นี้ — ผูกด้วย sub ก่อนเสมอ (ถาวร ไม่เปลี่ยน) ถ้าไม่เจอค่อยหาจากอีเมล
+// เพื่อเชื่อมบัญชีเดิมที่สมัครด้วยรหัสผ่าน (ตัดสินใจร่วมกับผู้ใช้ 2026-09-12: เชื่อมอัตโนมัติ เพราะ Google
+// ยืนยันแล้วว่าเป็นเจ้าของอีเมลนี้จริง — exchangeCodeForProfile ปฏิเสธอีเมลที่ยังไม่ยืนยันไปแล้ว)
+async function findCustomerForGoogle(profile) {
+    const [bySub] = await pool.query(`SELECT ${CUSTOMER_LOGIN_COLUMNS} FROM tb_customers WHERE cus_google_sub = ?`, [profile.sub]);
+    if (bySub[0]) return bySub[0];
+
+    // cus_email เป็น utf8mb4_unicode_ci เทียบแบบไม่สนตัวพิมพ์เล็ก-ใหญ่อยู่แล้ว
+    const [byEmail] = await pool.query(`SELECT ${CUSTOMER_LOGIN_COLUMNS} FROM tb_customers WHERE cus_email = ?`, [profile.email]);
+    const customer = byEmail[0];
+    if (!customer) return null;
+
+    // อีเมลตรงแต่บัญชีนี้ผูกกับ Google คนละบัญชีไว้แล้ว (เช่น เจ้าของย้ายอีเมลไปบัญชี Google ใหม่) — ไม่เขียนทับ
+    // เงียบๆ เพราะจะทำให้บัญชี Google เดิมเข้าไม่ได้โดยไม่มีใครรู้ ให้ใช้รหัสผ่านแทน
+    if (customer.cus_google_sub && customer.cus_google_sub !== profile.sub) {
+        throw Object.assign(new Error("อีเมลนี้เชื่อมกับบัญชี Google อื่นไว้แล้ว กรุณาเข้าสู่ระบบด้วยชื่อผู้ใช้และรหัสผ่าน"), { status: 409 });
+    }
+    return customer;
+}
+
+// ล็อกอินบัญชีที่หาเจอ (และผูก Google ให้ถ้ายังไม่เคยผูก) — ใช้ทั้งตอนล็อกอินปกติและตอนกดสร้างบัญชีแล้ว
+// พบว่ามีบัญชีเกิดขึ้นระหว่างทาง
+async function loginWithGoogle(customer, profile, userAgent) {
+    // ต่างจากล็อกอินด้วยรหัสผ่านที่ตอบกลางๆ "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" — ที่นี่ผู้ใช้พิสูจน์ตัวตนกับ Google
+    // แล้ว บอกตรงๆ ว่าบัญชีถูกระงับได้โดยไม่เปิดเผยอะไรเพิ่ม และช่วยให้เขาไปติดต่อแอดมินได้ถูกทาง
+    if (customer.cus_status !== "active") {
+        throw Object.assign(new Error("บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อแอดมิน"), { status: 403 });
+    }
+    if (!customer.cus_google_sub) {
+        // WHERE ... IS NULL กันสอง request เชื่อมพร้อมกันเขียนทับกัน
+        await pool.query("UPDATE tb_customers SET cus_google_sub = ? WHERE cus_id = ? AND cus_google_sub IS NULL", [profile.sub, customer.cus_id]);
+    }
+    return issueLoginToken(customer, userAgent);
+}
+
+// ชื่อผู้ใช้อัตโนมัติจากส่วนหน้าของอีเมล — ลูกค้าที่สมัครผ่าน Google ไม่ต้องตั้งเอง (ไม่ได้ใช้ล็อกอินอยู่แล้ว)
+// แต่คอลัมน์บังคับ NOT NULL UNIQUE และแอดมินใช้ค้นหาลูกค้า จึงควรเป็นคำที่อ่านออก ไม่ใช่เลขสุ่มล้วน
+function usernameCandidate(email, withSuffix) {
+    const base = email.split("@")[0].toLowerCase().replace(/[^a-z0-9._]/g, "").slice(0, 40) || "user";
+    return withSuffix ? `${base}${crypto.randomInt(1000, 10000)}` : base;
+}
+
+async function createGoogleCustomer(profile) {
+    const cus_id = await generateId("tb_customers", "CUS");
+    // รหัสผ่านสุ่ม 256 บิตที่ไม่มีใครรู้ — คอลัมน์บังคับ NOT NULL และทำให้ล็อกอินด้วยรหัสผ่านไม่ได้ในทางปฏิบัติ
+    // ถ้าลูกค้าอยากมีรหัสผ่านทีหลังกด "ลืมรหัสผ่าน" ได้ปกติ (ดู database/query/alter_customers_add_google_sub.sql)
+    const passwordHash = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
+    const fname = (profile.given_name || profile.name || "").slice(0, 50) || null;
+    const lname = (profile.family_name || "").slice(0, 50) || null;
+
+    // ชื่อผู้ใช้ชนกันได้ (อีเมลคนละโดเมนแต่ส่วนหน้าเหมือนกัน) — ลองชื่อเปล่าก่อน ชนแล้วค่อยต่อท้ายตัวเลขสุ่ม
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            await pool.query(
+                `INSERT INTO tb_customers
+                    (cus_id, cus_username, cus_email, cus_password, cus_google_sub, cus_fname, cus_lname,
+                     cus_must_change_password, cus_pdpa_consented_at, cus_signup_via)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, NOW(), 'google')`,
+                [cus_id, usernameCandidate(profile.email, attempt > 0), profile.email, passwordHash, profile.sub, fname, lname]
+            );
+            return { cus_id, cus_status: "active", cus_must_change_password: 0, cus_google_sub: profile.sub };
+        } catch (err) {
+            if (err.code === "ER_DUP_ENTRY" && /uq_cus_username/.test(err.sqlMessage ?? "")) continue;
+            throw err;
+        }
+    }
+    throw new Error("สร้างชื่อผู้ใช้ที่ไม่ซ้ำไม่สำเร็จ");
+}
+
+// ขั้นที่ 1 — รับ code จาก callback ของ Google (ส่งต่อมาจากเซิร์ฟเวอร์ Next)
+// บัญชีเดิม → ล็อกอินเลย / ลูกค้าใหม่ → ยังไม่สร้างบัญชี คืน signup_token ให้ไปกดยอมรับ PDPA ก่อน
+// (ตัดสินใจร่วมกับผู้ใช้: ขอความยินยอมแบบติ๊กเองเหมือนหน้าสมัครปกติ และไม่มีบัญชีค้างครึ่งๆ ถ้าปิดหน้าไป)
+async function googleLogin(req, res, next) {
+    try {
+        const { code, code_verifier, redirect_uri } = req.body ?? {};
+        const profile = await exchangeCodeForProfile({ code, codeVerifier: code_verifier, redirectUri: redirect_uri });
+
+        const customer = await findCustomerForGoogle(profile);
+        if (!customer) {
+            return res.json({ needs_signup: true, signup_token: signSignupToken(profile) });
+        }
+        res.json({ token: await loginWithGoogle(customer, profile, req.headers["user-agent"]) });
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ message: err.message });
+        next(err);
+    }
+}
+
+// ขั้นที่ 2 (เฉพาะลูกค้าใหม่) — กดยอมรับนโยบายความเป็นส่วนตัวแล้วสร้างบัญชี
+// ไม่ต้องใช้ OTP เหมือนสมัครปกติ เพราะ Google ยืนยันความเป็นเจ้าของอีเมลให้แล้ว (email_verified)
+async function googleSignupComplete(req, res, next) {
+    try {
+        const { signup_token, pdpa_consent } = req.body ?? {};
+        const profile = verifySignupToken(signup_token);
+        if (!pdpa_consent) {
+            return res.status(400).json({ message: "กรุณายอมรับนโยบายความเป็นส่วนตัวก่อนสมัครสมาชิก" });
+        }
+
+        const userAgent = req.headers["user-agent"];
+        // หาใหม่อีกรอบก่อนสร้าง — ระหว่างที่ผู้ใช้อ่านหน้ายอมรับ PDPA อาจมีบัญชีเกิดขึ้นแล้ว (กดสองแท็บพร้อมกัน /
+        // สมัครด้วยรหัสผ่านอีกแท็บ) ถ้ามีแล้วล็อกอินเข้าบัญชีนั้นแทน ไม่สร้างซ้ำ
+        const existing = await findCustomerForGoogle(profile);
+        if (existing) return res.json({ token: await loginWithGoogle(existing, profile, userAgent) });
+
+        try {
+            const created = await createGoogleCustomer(profile);
+            res.status(201).json({ token: await issueLoginToken(created, userAgent) });
+        } catch (err) {
+            // ชนที่อีเมล/sub = อีกแท็บเพิ่งสร้างสำเร็จไปก่อนหน้าเสี้ยววินาที — ล็อกอินเข้าบัญชีนั้นแทน
+            if (err.code !== "ER_DUP_ENTRY") throw err;
+            const raced = await findCustomerForGoogle(profile);
+            if (!raced) throw err;
+            res.json({ token: await loginWithGoogle(raced, profile, userAgent) });
+        }
+    } catch (err) {
+        if (err.status) return res.status(err.status).json({ message: err.message });
         next(err);
     }
 }
@@ -301,7 +431,8 @@ async function getMe(req, res, next) {
     try {
         const [rows] = await pool.query(
             `SELECT cus_id, cus_username, cus_fname, cus_lname, cus_email, cus_phone,
-                    cus_avatar_url, cus_must_change_password
+                    cus_avatar_url, cus_must_change_password,
+                    (cus_google_sub IS NOT NULL) AS google_linked
              FROM tb_customers WHERE cus_id = ?`,
             [req.customer.cus_id]
         );
@@ -383,6 +514,28 @@ async function updateMyProfile(req, res, next) {
     }
 }
 
+// แก้เฉพาะชื่อ-นามสกุล — ใช้ที่หน้าต้อนรับหลังสมัครด้วย Google (/welcome) ซึ่งถามแค่ชื่อกับรูป
+// แยกจาก updateMyProfile เพราะตัวนั้นบังคับส่งอีเมลมาด้วยทุกครั้ง ถ้าหน้าเว็บต้องอ่านอีเมลเดิมแล้วส่งกลับ
+// ก็เสี่ยงเขียนทับค่าที่เพิ่งเปลี่ยนจากอีกแท็บโดยไม่ตั้งใจ
+const NAME_MAX_LENGTH = 50; // ตรงกับ VARCHAR(50) ของ cus_fname/cus_lname — เกินแล้ว MySQL จะ error เป็น 500
+async function updateMyName(req, res, next) {
+    try {
+        const cus_fname = String(req.body?.cus_fname ?? "").trim();
+        const cus_lname = String(req.body?.cus_lname ?? "").trim();
+        if (!cus_fname || !cus_lname) {
+            return res.status(400).json({ message: "กรุณากรอกชื่อและนามสกุล" });
+        }
+        if (cus_fname.length > NAME_MAX_LENGTH || cus_lname.length > NAME_MAX_LENGTH) {
+            return res.status(400).json({ message: `ชื่อและนามสกุลยาวได้ไม่เกิน ${NAME_MAX_LENGTH} ตัวอักษร` });
+        }
+
+        await pool.query("UPDATE tb_customers SET cus_fname = ?, cus_lname = ? WHERE cus_id = ?", [cus_fname, cus_lname, req.customer.cus_id]);
+        res.json({ message: "บันทึกชื่อเรียบร้อยแล้ว" });
+    } catch (err) {
+        next(err);
+    }
+}
+
 // เปลี่ยนรหัสผ่านตามใจสมัคร (ไม่บังคับ ต่างจาก completeOnboarding) — เชื่อ session ที่ login อยู่แล้ว
 // เหมือน pattern changeOwnPassword ฝั่ง staff ไม่ต้องกรอกรหัสผ่านเดิมซ้ำ
 async function changeMyPassword(req, res, next) {
@@ -437,4 +590,5 @@ async function logout(req, res, next) {
 module.exports = {
     register, login, getMe, completeOnboarding, updateMyProfile, changeMyPassword, uploadMyImage,
     getMySessions, deleteMySession, logout, forgotPassword, resetPassword, requestRegisterOtp,
+    googleLogin, googleSignupComplete, updateMyName,
 };

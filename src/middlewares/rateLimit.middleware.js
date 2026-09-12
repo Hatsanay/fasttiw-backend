@@ -60,4 +60,5 @@ function resetAll() {
     buckets.clear();
 }
 
-module.exports = { rateLimit, resetAll };
+// clientKey ใช้ร่วมกับตัวนับผู้เยี่ยมชม (visit.controller.js) — กติกาเชื่อ IP จาก header ต้องเป็นชุดเดียวกันทุกที่
+module.exports = { rateLimit, resetAll, clientKey };
