@@ -38,7 +38,18 @@ function ownsConversation(conv, { custId, guestId }) {
 //    ข้อความเพราะเป็นแถวเดียวกัน) ไม่มีก็สร้างใหม่
 // 3. ยังไม่ login -> หา/สร้างแชทผู้เยี่ยมชมตาม guestId
 // UNIQUE KEY บน conv_customer_id/conv_guest_id ป้องกัน race แทรกซ้ำซ้อน (จับ ER_DUP_ENTRY แล้ว query ซ้ำ)
-async function ensureConversation({ custId, guestId }) {
+//
+// ⚠ แชทที่ผูกบัญชีแล้วต้องไม่มี conv_guest_id ค้างอยู่ (บั๊กที่เจอบน production 2026-09-15) — เดิมข้อ 2 ผูกบัญชี
+// แต่ปล่อย guest id ไว้ในแถว พอลูกค้าออกจากระบบ (หรือ cookie เซสชันหมดอายุ/ถูกเตะ) เบราว์เซอร์เดิมยังส่ง
+// guest id เดิมมา ข้อ 3 เลยหาเจอแชทของบัญชีนั้นแล้วคืน conv_id ให้ แต่ ownsConversation ไม่ยอมให้ผู้เยี่ยมชม
+// เข้าแชทที่มีเจ้าของ -> ส่งข้อความได้ 404 ทุกครั้ง หน้าแชทดูเหมือนกดส่งไม่ได้ (เป็นเฉพาะเบราว์เซอร์ที่เคย login)
+//
+// create: false = "หาอย่างเดียว" (2026-09-15) — ทำทุกอย่างข้างบนครบ (รวม merge ตอน login) แต่ถ้ายังไม่มีห้องจะคืน
+// null แทนการสร้าง ChatWidget ใช้ตอนเปิดหน้าเว็บ แล้วค่อยสร้างห้องตอนลูกค้าส่งข้อความแรก — เดิมสร้างห้องให้ทุกคน
+// ที่เปิดเว็บ รายการแชทแอดมินเต็มไปด้วยห้องว่าง และทุกคนต้อง poll ห้องว่างของตัวเองทุก 10 วิ (ผลทดสอบโหลด:
+// แชท poll กิน CPU ของเว็บลูกค้าราว 1/3 ของคนที่เปิดเว็บทิ้งไว้) · ค่าเริ่มต้นยังเป็น true ให้ JS เก่าที่ค้างใน
+// เบราว์เซอร์ลูกค้าหลัง deploy ยังใช้ได้ — ผลที่ตามมาซึ่งตกลงกับผู้ใช้แล้ว: แอดมินทักคนที่ยังไม่เคยพิมพ์มาก่อนไม่ได้
+async function ensureConversation({ custId, guestId, create = true }) {
     if (custId) {
         const [[ownConv]] = await pool.query("SELECT * FROM tb_chat_conversations WHERE conv_customer_id = ?", [custId]);
         if (ownConv) {
@@ -60,21 +71,34 @@ async function ensureConversation({ custId, guestId }) {
                 [guestId]
             );
             if (guestConv) {
-                await pool.query("UPDATE tb_chat_conversations SET conv_customer_id = ? WHERE conv_id = ?", [custId, guestConv.conv_id]);
-                return { ...guestConv, conv_customer_id: custId };
+                // ปลด guest id ออกพร้อมกันเสมอ — แชทนี้เป็นของบัญชีแล้ว (ดูหมายเหตุ ⚠ ด้านบน)
+                await pool.query(
+                    "UPDATE tb_chat_conversations SET conv_customer_id = ?, conv_guest_id = NULL WHERE conv_id = ?",
+                    [custId, guestConv.conv_id]
+                );
+                return { ...guestConv, conv_customer_id: custId, conv_guest_id: null };
             }
         }
-        return insertConversation({ conv_customer_id: custId, conv_guest_id: null });
+        return create ? insertConversation({ conv_customer_id: custId, conv_guest_id: null }) : null;
     }
 
     if (!guestId) {
+        if (!create) return null;
         const err = new Error("ต้องมี guest id");
         err.status = 400;
         throw err;
     }
     const [[existing]] = await pool.query("SELECT * FROM tb_chat_conversations WHERE conv_guest_id = ?", [guestId]);
-    if (existing) return existing;
-    return insertConversation({ conv_customer_id: null, conv_guest_id: guestId });
+    if (existing && !existing.conv_customer_id) return existing;
+    if (existing) {
+        // แถวที่ผูกบัญชีไปก่อนแก้บั๊ก (ยังจำ guest id นี้ค้างอยู่) — ปลดออกแล้วเปิดแชทผู้เยี่ยมชมใหม่ให้
+        // ต้องปลดก่อน insert ไม่งั้นชน UNIQUE ของ conv_guest_id · ข้อความเดิมยังอยู่ในแชทของบัญชีครบ
+        await pool.query(
+            "UPDATE tb_chat_conversations SET conv_guest_id = NULL WHERE conv_id = ? AND conv_customer_id IS NOT NULL",
+            [existing.conv_id]
+        );
+    }
+    return create ? insertConversation({ conv_customer_id: null, conv_guest_id: guestId }) : null;
 }
 
 async function insertConversation(fields) {
@@ -90,7 +114,7 @@ async function insertConversation(fields) {
             const [[existing]] = await pool.query(
                 fields.conv_customer_id
                     ? "SELECT * FROM tb_chat_conversations WHERE conv_customer_id = ?"
-                    : "SELECT * FROM tb_chat_conversations WHERE conv_guest_id = ?",
+                    : "SELECT * FROM tb_chat_conversations WHERE conv_guest_id = ? AND conv_customer_id IS NULL",
                 [fields.conv_customer_id ?? fields.conv_guest_id]
             );
             if (existing) return existing;
@@ -102,10 +126,12 @@ async function insertConversation(fields) {
 }
 
 // POST /store/chat/conversation — หา/สร้างแชทของผู้ถามคนปัจจุบัน (ดูรายละเอียด merge ที่ ensureConversation)
+// body { create: false } = หาอย่างเดียว ไม่มีห้องได้ conv_id: null
 async function ensureMyConversation(req, res, next) {
     try {
         const identity = getRequesterIdentity(req);
-        const conv = await ensureConversation(identity);
+        const conv = await ensureConversation({ ...identity, create: req.body?.create !== false });
+        if (!conv) return res.json({ conv_id: null, is_customer: !!identity.custId });
         res.json({ conv_id: conv.conv_id, is_customer: !!conv.conv_customer_id });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
@@ -250,6 +276,8 @@ async function sendMyMessage(req, res, next) {
 // ─── ฝั่งแอดมิน — กล่องข้อความรวม ทุกคนที่มีสิทธิ์ chatManagement เห็น/ตอบได้ทุกแชท ────────────────────
 // GET /chat/conversations — รายการแชททั้งหมด เรียงตามข้อความล่าสุด แสดงชื่อ+ป้าย "ลูกค้า"/"ผู้เยี่ยมชม"
 // ให้แยกออกชัดเจน (conv_customer_id ไม่ NULL = ลูกค้าที่ login แล้ว)
+// ไม่แสดงห้องที่ยังไม่มีข้อความเลย (INNER JOIN ข้อความล่าสุด) — ห้องว่างเกิดจาก JS รุ่นเก่าที่สร้างห้องให้ทุกคน
+// ที่เปิดเว็บ (ดู create: false ที่ ensureConversation) ไม่มีประโยชน์กับแอดมิน มีแต่ทำให้รายการรก
 async function listConversations(req, res, next) {
     try {
         const [rows] = await pool.query(`
@@ -259,7 +287,7 @@ async function listConversations(req, res, next) {
                 lm.msg_text AS last_msg_text, lm.msg_image_urls AS last_msg_image_urls, lm.msg_sender_type AS last_msg_sender_type
             FROM tb_chat_conversations c
             LEFT JOIN tb_customers cus ON cus.cus_id = c.conv_customer_id
-            LEFT JOIN tb_chat_messages lm ON lm.msg_id = (
+            JOIN tb_chat_messages lm ON lm.msg_id = (
                 SELECT msg_id FROM tb_chat_messages WHERE msg_conv_id = c.conv_id ORDER BY msg_id DESC LIMIT 1
             )
             ORDER BY c.conv_last_message_at DESC
