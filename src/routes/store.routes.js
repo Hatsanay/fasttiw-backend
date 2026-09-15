@@ -8,6 +8,7 @@ const dataDeletionRequestController = require("../controllers/dataDeletionReques
 const questionReportController = require("../controllers/questionReport.controller");
 const newsController = require("../controllers/news.controller");
 const chatController = require("../controllers/chat.controller");
+const diagnosticController = require("../controllers/diagnostic.controller");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
 const { uploadImage } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
@@ -78,6 +79,15 @@ router.get("/V1/store/products/popular", storeController.getPopularProducts);
 router.get("/V1/store/products/:id", storeController.getPublicProduct);
 router.get("/V1/store/products/:id/sample-questions", storeController.getSampleQuestions);
 router.get("/V1/store/packages", storeController.getPublicPackages);
+// แบบทดสอบวัดระดับฟรี — สาธารณะ ดู controllers/diagnostic.controller.js · ลิมิตหลวมพอให้ทำซ้ำหลายรอบได้สบาย
+// (คน 1 คนทำ 1 รอบ = ขอข้อ 1 + ตรวจ 1) แต่กันสคริปต์ยิงสุ่มข้อรัวๆ
+const diagnosticLimiter = rateLimit({
+    name: "diagnostic", windowMs: 10 * 60 * 1000, max: 60,
+    message: "ทำแบบทดสอบถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+router.get("/V1/store/diagnostic", diagnosticController.listDiagnosticCategories);
+router.get("/V1/store/diagnostic/:categoryId/questions", diagnosticLimiter, diagnosticController.getDiagnosticQuestions);
+router.post("/V1/store/diagnostic/:categoryId/grade", diagnosticLimiter, diagnosticController.gradeDiagnostic);
 router.get("/V1/store/categories", storeController.getPublicCategories);
 // ข่าวสาร/ประกาศ — ฟีดเดียว (ไม่มี "โพสต์" แยกกัน) เนื้อหาการตลาด/ประชาสัมพันธ์ ไม่ใช่เนื้อหาข้อสอบที่ต้อง
 // ปกป้อง จึงเปิดสาธารณะเหมือน products/packages (ดูได้โดยไม่ต้อง login) เมนูในหน้าเว็บจะโชว์เฉพาะหลัง login
@@ -113,6 +123,9 @@ router.get("/V1/store/attempts", requireCustomerAuth, attemptController.getAttem
 router.get("/V1/store/attempts/summary", requireCustomerAuth, attemptController.getProductSummary);
 router.get("/V1/store/me/weak-areas", requireCustomerAuth, attemptController.getWeakAreas);
 router.get("/V1/store/me/mistakes", requireCustomerAuth, attemptController.getMistakes);
+// ทำใหม่ข้อที่เคยผิด — ดู getMistakePractice/retryMistake (ต้องประกาศ /practice ก่อน route ที่มี :param เสมอ)
+router.get("/V1/store/me/mistakes/practice", requireCustomerAuth, attemptController.getMistakePractice);
+router.post("/V1/store/me/mistakes/:questionId/retry", requireCustomerAuth, attemptController.retryMistake);
 router.get("/V1/store/attempts/:id", requireCustomerAuth, attemptController.getAttempt);
 router.put("/V1/store/attempts/:id/answers/:questionId", requireCustomerAuth, attemptController.submitAnswer);
 router.post("/V1/store/attempts/:id/submit", requireCustomerAuth, attemptController.submitAttempt);

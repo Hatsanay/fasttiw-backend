@@ -59,7 +59,7 @@ async function getOne(req, res, next) {
         const [rows] = await pool.query(
             `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
                     p.prod_category_id, p.prod_commission_staff_id, p.prod_commission_type, p.prod_commission_value,
-                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score,
+                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score, p.prod_pass_percent,
                     p.prod_created_at, p.prod_updated_at,
                     c.cat_name AS prod_category_name
              FROM tb_products p
@@ -113,6 +113,15 @@ function validateEntitlementDuration(prod_entitlement_duration_months) {
     return null;
 }
 
+// เกณฑ์ผ่าน (%) — ไม่บังคับ ว่าง/ไม่ส่ง = ไม่ตั้งเกณฑ์ (หน้าผลลูกค้าไม่แสดงผ่าน/ไม่ผ่าน) ตั้งได้ 1-100 จำนวนเต็ม
+function validatePassPercent(prod_pass_percent) {
+    if (prod_pass_percent === undefined || prod_pass_percent === null || prod_pass_percent === "") return null;
+    const value = Number(prod_pass_percent);
+    if (!Number.isInteger(value) || value < 1 || value > 100) return "เกณฑ์ผ่านต้องเป็นจำนวนเต็ม 1-100 (%) หรือเว้นว่างถ้าไม่ตั้งเกณฑ์";
+    return null;
+}
+const normalizePassPercent = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
+
 // ไม่มี validation ราคามาก่อนเลย — ราคาติดลบหลุดเข้าไปได้ (เช่น พิมพ์ผิด) แล้วไปลดยอดรวมทั้งตะกร้าตอน
 // checkout() ผิดเพี้ยนได้ (subtotal รวมค่าติดลบเข้าไปด้วย) อนุญาต 0 ไว้เผื่อ product แจกฟรี แต่ห้ามติดลบ
 function validatePrice(prod_price) {
@@ -139,7 +148,7 @@ async function create(req, res, next) {
         const {
             prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
-            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score,
+            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score, prod_pass_percent,
         } = req.body;
         if (!prod_name) return res.status(400).json({ message: "กรุณากรอกชื่อชุดข้อสอบ" });
 
@@ -151,6 +160,8 @@ async function create(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const totalScoreError = validateTotalScore(prod_total_score);
         if (totalScoreError) return res.status(400).json({ message: totalScoreError });
+        const passPercentError = validatePassPercent(prod_pass_percent);
+        if (passPercentError) return res.status(400).json({ message: passPercentError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -161,12 +172,13 @@ async function create(req, res, next) {
             `INSERT INTO tb_products
                 (prod_id, prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id, prod_created_by_id,
                  prod_commission_staff_id, prod_commission_type, prod_commission_value, prod_exam_duration_minutes,
-                 prod_entitlement_duration_months, prod_total_score)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 prod_entitlement_duration_months, prod_total_score, prod_pass_percent)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 prod_id, prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, prod_category_id || null, req.user.user_id,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
                 prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null, normalizeTotalScore(prod_total_score),
+                normalizePassPercent(prod_pass_percent),
             ]
         );
 
@@ -193,6 +205,8 @@ async function update(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const totalScoreError = validateTotalScore(prod_total_score);
         if (totalScoreError) return res.status(400).json({ message: totalScoreError });
+        const passPercentError = validatePassPercent(req.body.prod_pass_percent);
+        if (passPercentError) return res.status(400).json({ message: passPercentError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -221,6 +235,13 @@ async function update(req, res, next) {
                 req.params.id,
             ]
         );
+        // เกณฑ์ผ่านเปลี่ยนเฉพาะตอนส่งฟิลด์นี้มาจริง — หน้าจอ/สคริปต์ที่ไม่รู้จักฟิลด์นี้ (เช่น JS แอดมินรุ่นเก่า
+        // ที่ค้างในเบราว์เซอร์หลัง deploy) กดบันทึกแล้วต้องไม่ลบเกณฑ์ที่ตั้งไว้ทิ้งเงียบๆ
+        if (Object.prototype.hasOwnProperty.call(req.body, "prod_pass_percent")) {
+            await pool.query("UPDATE tb_products SET prod_pass_percent = ? WHERE prod_id = ?", [
+                normalizePassPercent(req.body.prod_pass_percent), req.params.id,
+            ]);
+        }
 
         res.json({ message: "แก้ไขชุดข้อสอบสำเร็จ" });
     } catch (err) {

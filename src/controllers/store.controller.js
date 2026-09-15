@@ -2,7 +2,7 @@ const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { findValidCoupon, incrementUsage } = require("./coupon.controller");
 const { grantOrRenewProduct, calculateDiscount, recordSale, linkEntitlementsToSale, snapshotExpiries } = require("./entitlement.controller");
-const { fetchSampleQuestions, buildQuestionPayload } = require("./attempt.controller");
+const { fetchSampleQuestions, buildQuestionPayload, SAMPLE_QUESTION_COUNT } = require("./attempt.controller");
 const stripeClient = require("../utils/stripeClient");
 const settingsController = require("./settings.controller");
 const { getEffectivePrice } = require("../utils/pricing");
@@ -14,8 +14,6 @@ const { buildReceiptEmail } = require("../utils/emailTemplates");
 // ก็ไม่มี field หมดอายุเลย) จึงกำหนด TTL เองฝั่งเรา แล้วให้ jobs/orderExpirySweep.js เป็นคนยกเลิก PaymentIntent
 // ที่ค้างเกินเวลาแทน (เช็คสถานะจริงกับ Stripe ก่อนยกเลิกทุกครั้ง กันเคส race ที่ลูกค้าเพิ่งจ่ายสำเร็จไปพอดี)
 const PROMPTPAY_QR_TTL_MS = 60 * 60 * 1000; // 1 ชม. — ตัดสินใจร่วมกับผู้ใช้แล้ว (ไม่มีตัวเลขอ้างอิงจาก Stripe ให้ใช้)
-
-const SAMPLE_QUESTION_COUNT = 10;
 
 // ─── รายการชุดข้อสอบสาธารณะ (ไม่ auth) — บังคับ published เสมอ ไม่รับ status จาก query
 // เหมือนฝั่งแอดมิน และไม่ส่งฟิลด์ค่าคอม (ข้อมูลภายในธุรกิจ ไม่ควรหลุดออกไปฝั่งลูกค้า) ─────────────

@@ -75,6 +75,11 @@ async function fetchQuestionsByIds(questionIds) {
     return buildQuestionMap(questions);
 }
 
+// จำนวนข้อ "ตัวอย่างฟรี" ต่อชุด = ข้อที่เปิดเฉลยให้คนทั่วไปดูได้โดยไม่ต้องซื้อ — ใช้ร่วมกันทั้งหน้าตัวอย่าง
+// (/products/[id]/sample) และแบบทดสอบวัดระดับ (diagnostic.controller.js) ห้ามแยกกันตั้ง ไม่งั้นแบบทดสอบ
+// วัดระดับจะเปิดเฉลยของข้อที่ต้องซื้อหลุดออกไปฟรี
+const SAMPLE_QUESTION_COUNT = 10;
+
 // ดึงคำถามตัวอย่างจำนวนจำกัดของ product (ใช้กับหน้าตัวอย่างฟรีก่อนซื้อ) — กรอง+จำกัดจำนวนที่ระดับ SQL
 // เลย (ORDER BY + LIMIT) แทนที่จะดึงคำถามทั้งคลังมาเก็บใน JS แล้วค่อย .slice() ทีหลัง เพราะ endpoint นี้
 // ไม่ต้อง login เรียกได้อิสระ ถ้า product มีคำถามเยอะจะโดนดึงข้อมูลทิ้งจำนวนมากทุกครั้งที่มีคนเข้าดูตัวอย่าง
@@ -405,8 +410,26 @@ async function abandonAttempt(req, res, next) {
 // ใช้ร่วมกันระหว่างตัวนับรายชุดใน getProductSummary กับลิสต์จริงใน getMistakes — ถ้าแยกกันเขียน
 // วันไหนแก้ที่เดียวลืมอีกที่ ตัวเลข "ต้องทบทวน N ข้อ" บนหน้าสรุปจะไม่ตรงกับจำนวนการ์ดที่กดเข้าไปเห็นจริง
 // ซึ่งเป็นบั๊กที่ผู้ใช้เจอก่อนเราเสมอ
-const LATEST_CORRECT_SQL =
-    "SUBSTRING_INDEX(GROUP_CONCAT(a.ans_is_correct ORDER BY att.att_submitted_at DESC), ',', 1) + 0";
+//
+// "ครั้งที่ตอบ" มาจาก 2 แหล่ง (2026-09-15): คำตอบในข้อสอบที่ส่งแล้ว + การทำใหม่จากหน้าทบทวน (tb_mistake_retries)
+// ทำใหม่ถูก = ครั้งล่าสุดถูก = หลุดจากรายการเอง · สอบรอบหน้าแล้วผิดอีก = กลับมาอยู่ในรายการ
+// การทำใหม่มีผลกับเรื่องนี้เรื่องเดียว — ไม่ปนในคะแนน/ประวัติ/จุดอ่อนรายหมวด (พวกนั้นอ่านจาก attempt ตรงๆ)
+// ทุก query ที่ตัดสินว่า "ต้องทบทวนไหม" ต้องอ่านผ่าน mistakeEventsSql() เท่านั้น ห้ามกลับไป JOIN คำตอบเอง
+// ใส่ customer filter ในแต่ละฝั่งของ UNION เอง (ไม่พึ่ง optimizer ดันเงื่อนไขเข้า derived table) → params [cid, cid]
+const mistakeEventsSql = () => `(
+    SELECT a.ans_question_id AS question_id, att.att_product_id AS product_id, a.ans_is_correct AS is_correct,
+           a.ans_selected_choice_id AS choice_id, att.att_submitted_at AS answered_at
+    FROM tb_attempt_answers a
+    JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+    WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
+    UNION ALL
+    SELECT r.mr_question_id, q.ques_product_id, r.mr_is_correct, r.mr_selected_choice_id, r.mr_created_at
+    FROM tb_mistake_retries r
+    JOIN tb_questions q ON q.ques_id = r.mr_question_id
+    WHERE r.mr_customer_id = ?
+) ev`;
+const LATEST_CORRECT_SQL = "SUBSTRING_INDEX(GROUP_CONCAT(ev.is_correct ORDER BY ev.answered_at DESC), ',', 1) + 0";
+const WRONG_COUNT_SQL = "SUM(ev.is_correct = 0)";
 const UNRESOLVED_MISTAKE_HAVING = "HAVING wrong_count > 0 AND latest_correct = 0";
 
 
@@ -415,19 +438,52 @@ const UNRESOLVED_MISTAKE_HAVING = "HAVING wrong_count > 0 AND latest_correct = 0
 async function countUnresolvedMistakes(customerId, productId) {
     const [[row]] = await pool.query(
         `SELECT COUNT(*) AS total FROM (
-            SELECT SUM(a.ans_is_correct = 0) AS wrong_count,
+            SELECT ${WRONG_COUNT_SQL} AS wrong_count,
                    ${LATEST_CORRECT_SQL} AS latest_correct
-            FROM tb_attempt_answers a
-            JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
-            JOIN tb_questions q ON q.ques_id = a.ans_question_id
-            WHERE att.att_customer_id = ? AND att.att_status = 'submitted'
-              AND a.ans_is_correct IS NOT NULL AND q.ques_product_id = ?
-            GROUP BY a.ans_question_id
+            FROM ${mistakeEventsSql()}
+            WHERE ev.product_id = ?
+            GROUP BY ev.question_id
             ${UNRESOLVED_MISTAKE_HAVING}
          ) m`,
-        [customerId, productId]
+        [customerId, customerId, productId]
     );
     return Number(row.total);
+}
+
+// "ถ้าสอบวันนี้ ผ่านไหม" (2026-09-15) — เทียบผลใบนี้กับเกณฑ์ผ่านของชุด (prod_pass_percent, NULL = ไม่ตั้ง → null)
+// ชุดที่ใช้ระบบคะแนนเทียบ "คะแนน" (earned/max ที่ freeze ไว้) ชุดที่ไม่ใช้เทียบ "จำนวนข้อ" — ตรงกับที่ att_score คิดไว้
+// correctCount นับจาก ans_is_correct ของทุกข้อใน attempt (รวมข้อที่แอดมินปิดไปทีหลัง) ห้ามถอดจาก att_score ที่ปัดแล้ว
+function buildReadiness(attempt, passPercent, correctCount) {
+    if (passPercent == null) return null;
+    const pass = Number(passPercent);
+    const scored = attempt.att_max_score != null && Number(attempt.att_max_score) > 0;
+    if (scored) {
+        const earned = Number(attempt.att_earned_score) || 0;
+        const required = Math.round((pass / 100) * Number(attempt.att_max_score) * 100) / 100;
+        const passed = earned + 1e-9 >= required;
+        return { pass_percent: pass, passed, unit: "points", required, gap: passed ? 0 : Math.round((required - earned) * 100) / 100 };
+    }
+    const total = Number(attempt.att_total_questions) || 0;
+    const required = Math.ceil((pass / 100) * total - 1e-9); // 60% ของ 15 ข้อ = 9 ข้อ, ของ 16 ข้อ = 10 ข้อ (ปัดขึ้น)
+    const passed = correctCount >= required;
+    return { pass_percent: pass, passed, unit: "questions", required, gap: passed ? 0 : required - correctCount };
+}
+
+// เวลาเฉลี่ยต่อข้อเทียบกับเวลาที่ชุดกำหนด — เฉพาะโหมดจับเวลา (โหมดฝึกนับเวลาอ่านเฉลยรวมไปด้วย เทียบไม่ได้)
+// ใช้เวลาเริ่ม-ส่งที่มีอยู่แล้ว ไม่ต้องเก็บเวลารายข้อเพิ่ม
+function buildPace(attempt) {
+    const limitMinutes = Number(attempt.att_time_limit_minutes);
+    const total = Number(attempt.att_total_questions);
+    if (attempt.att_mode !== "timed" || !limitMinutes || !total || !attempt.att_started_at || !attempt.att_submitted_at) return null;
+    const limitSeconds = limitMinutes * 60;
+    // ส่งอัตโนมัติตอนหมดเวลาอาจช้ากว่ากำหนดเล็กน้อย — ตัดไม่ให้เกินเวลาที่กำหนด
+    const usedSeconds = Math.min(limitSeconds, Math.max(0, Math.round((new Date(attempt.att_submitted_at) - new Date(attempt.att_started_at)) / 1000)));
+    return {
+        used_seconds: usedSeconds,
+        limit_seconds: limitSeconds,
+        avg_seconds_per_question: Math.round(usedSeconds / total),
+        target_seconds_per_question: Math.round(limitSeconds / total),
+    };
 }
 
 async function getReview(req, res, next) {
@@ -447,7 +503,7 @@ async function getReview(req, res, next) {
         );
         const answerByQuestion = Object.fromEntries(answers.map((a) => [a.ans_question_id, a]));
 
-        const [[product]] = await pool.query("SELECT prod_name FROM tb_products WHERE prod_id = ?", [attempt.att_product_id]);
+        const [[product]] = await pool.query("SELECT prod_name, prod_pass_percent FROM tb_products WHERE prod_id = ?", [attempt.att_product_id]);
 
         // is_correct ต้องมาจาก ans_is_correct ที่บันทึกไว้ตอนตอบจริง (frozen ณ ตอนนั้น) ห้ามคำนวณสดจาก
         // choices.cho_is_correct ปัจจุบัน — เพราะแอดมินอาจแก้เฉลยทีหลัง (เช่น มีคนแจ้งปัญหาข้อนี้แล้วแก้ให้ถูก)
@@ -513,6 +569,9 @@ async function getReview(req, res, next) {
             prev_score: prev?.att_score ?? null,
             // จำนวนข้อของชุดนี้ที่ยังตอบผิดอยู่ (นับข้ามทุกครั้งที่ทำ ไม่ใช่เฉพาะใบนี้) — ใช้กับปุ่มไปหน้าทบทวน
             mistake_count: await countUnresolvedMistakes(req.customer.cus_id, attempt.att_product_id),
+            // null = ชุดนี้ไม่ได้ตั้งเกณฑ์ผ่าน / ไม่ใช่โหมดจับเวลา — หน้าเว็บซ่อนส่วนนั้นไปเลย
+            readiness: buildReadiness(attempt, product?.prod_pass_percent, answers.filter((a) => a.ans_is_correct).length),
+            pace: buildPace(attempt),
             topic_breakdown: topicRows.map((t) => ({
                 tpc_id: t.tpc_id,
                 tpc_name: t.tpc_name,
@@ -615,17 +674,15 @@ async function getProductSummary(req, res, next) {
         // (จุดอ่อนบอกว่าอ่อนหมวดไหน แต่ไม่บอกว่ามีกี่ข้อรออยู่ และกดไปทำอะไรต่อไม่ได้)
         const [mistakeRows] = await pool.query(
             `SELECT m.att_product_id, COUNT(*) AS mistakes FROM (
-                SELECT att.att_product_id,
-                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                SELECT ev.product_id AS att_product_id,
+                       ${WRONG_COUNT_SQL} AS wrong_count,
                        ${LATEST_CORRECT_SQL} AS latest_correct
-                FROM tb_attempt_answers a
-                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
-                WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
-                GROUP BY att.att_product_id, a.ans_question_id
+                FROM ${mistakeEventsSql()}
+                GROUP BY ev.product_id, ev.question_id
                 ${UNRESOLVED_MISTAKE_HAVING}
              ) m
              GROUP BY m.att_product_id`,
-            [customerId]
+            [customerId, customerId]
         );
         const mistakesByProduct = {};
         for (const m of mistakeRows) mistakesByProduct[m.att_product_id] = Number(m.mistakes);
@@ -678,6 +735,114 @@ async function getProductSummary(req, res, next) {
     }
 }
 
+// ─── "ทำใหม่ 10 ข้อที่เคยผิด" (2026-09-15) ───────────────────────────────────────────────────────────
+// หยิบข้อที่ยังต้องทบทวน (นิยามเดียวกับรายการ — UNRESOLVED_MISTAKE_HAVING) มาให้ตอบใหม่แบบโหมดฝึก:
+// ตอบแล้วเห็นเฉลยทันที ตอบถูก = บันทึกลง tb_mistake_retries แล้วข้อนั้นหลุดจากรายการเอง
+// เฉพาะชุดที่ยังมีสิทธิ์อยู่ (สิทธิ์หมด/ถูกยกเลิก = ทำใหม่ไม่ได้ เหมือนทำข้อสอบชุดนั้นไม่ได้)
+const PRACTICE_SIZE = 10;
+
+async function entitledProductIds(customerId, productIds) {
+    const unique = [...new Set(productIds)];
+    const checks = await Promise.all(unique.map((pid) => hasActiveEntitlement(customerId, pid)));
+    return new Set(unique.filter((_, i) => checks[i]));
+}
+
+// GET /store/me/mistakes/practice?product_id=&topic_id= — ข้อที่ผิดซ้ำหลายครั้งมาก่อน (สัญญาณชัดสุดว่ายังไม่เข้าใจ)
+// เสมอกันสุ่มลำดับ ทำรอบหน้าจะได้ไม่เจอ 10 ข้อเดิมทุกครั้ง · ส่งแบบไม่มีเฉลย (เฉลยมาตอนตอบ)
+async function getMistakePractice(req, res, next) {
+    try {
+        const customerId = req.customer.cus_id;
+        const conditions = ["q.ques_status = 'active'"];
+        const params = [customerId, customerId];
+        if (req.query.product_id) { conditions.push("q.ques_product_id = ?"); params.push(req.query.product_id); }
+        if (req.query.topic_id) { conditions.push("q.ques_topic_id = ?"); params.push(req.query.topic_id); }
+
+        const [rows] = await pool.query(
+            `SELECT m.ques_id, m.ques_product_id FROM (
+                SELECT q.ques_id, q.ques_product_id,
+                       ${WRONG_COUNT_SQL} AS wrong_count,
+                       ${LATEST_CORRECT_SQL} AS latest_correct
+                FROM ${mistakeEventsSql()}
+                JOIN tb_questions q ON q.ques_id = ev.question_id
+                WHERE ${conditions.join(" AND ")}
+                GROUP BY q.ques_id, q.ques_product_id
+                ${UNRESOLVED_MISTAKE_HAVING}
+             ) m
+             ORDER BY m.wrong_count DESC, RAND()`,
+            params
+        );
+        const entitled = await entitledProductIds(customerId, rows.map((r) => r.ques_product_id));
+        const available = rows.filter((r) => entitled.has(r.ques_product_id));
+        const picked = shuffle(available.slice(0, PRACTICE_SIZE));
+
+        const questionMap = await fetchQuestionsByIds(picked.map((r) => r.ques_id));
+        const [meta] = picked.length
+            ? await pool.query(
+                  `SELECT q.ques_id, p.prod_name, t.tpc_name FROM tb_questions q
+                   JOIN tb_products p ON p.prod_id = q.ques_product_id
+                   LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
+                   WHERE q.ques_id IN (?)`,
+                  [picked.map((r) => r.ques_id)]
+              )
+            : [[]];
+        const metaById = Object.fromEntries(meta.map((m) => [m.ques_id, m]));
+
+        res.json({
+            questions: picked
+                .filter((r) => questionMap[r.ques_id])
+                .map((r) => {
+                    const q = questionMap[r.ques_id];
+                    return {
+                        ...buildQuestionPayload(q, q.choices.map((c) => c.cho_id), null, false),
+                        prod_name: metaById[r.ques_id]?.prod_name ?? null,
+                        tpc_name: metaById[r.ques_id]?.tpc_name ?? null,
+                    };
+                }),
+            // ข้อที่ยังต้องทบทวนทั้งหมดที่ทำใหม่ได้ (ตามตัวกรอง) — หน้าเว็บบอก "เหลืออีก N ข้อ"
+            remaining: available.length,
+            // ข้อที่ต้องทบทวนแต่อยู่ในชุดที่สิทธิ์หมดแล้ว — บอกลูกค้าตรงๆ ว่าทำไมไม่ขึ้นมา
+            locked: rows.length - available.length,
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
+// POST /store/me/mistakes/:questionId/retry — body { cho_id } → บันทึก + ส่งเฉลยกลับทันที
+// ต้องเป็นข้อที่ลูกค้าคนนี้เคยตอบผิดจริง (กันใช้ endpoint นี้เปิดเฉลยข้อที่ไม่เคยทำ) + ยังมีสิทธิ์ในชุดนั้น
+async function retryMistake(req, res, next) {
+    try {
+        const customerId = req.customer.cus_id;
+        const { questionId } = req.params;
+        const choId = typeof req.body?.cho_id === "string" ? req.body.cho_id : null;
+
+        const [[history]] = await pool.query(
+            `SELECT ${WRONG_COUNT_SQL} AS wrong_count FROM ${mistakeEventsSql()} WHERE ev.question_id = ?`,
+            [customerId, customerId, questionId]
+        );
+        if (!history || !Number(history.wrong_count)) return res.status(404).json({ message: "ไม่พบข้อนี้ในรายการที่ต้องทบทวน" });
+
+        const questionMap = await fetchQuestionsByIds([questionId]);
+        const question = questionMap[questionId];
+        if (!question) return res.status(404).json({ message: "ข้อนี้ถูกปิดใช้งานแล้ว" });
+        const [[{ ques_product_id: productId }]] = await pool.query("SELECT ques_product_id FROM tb_questions WHERE ques_id = ?", [questionId]);
+        if (!(await requireStillEntitled(customerId, productId, res))) return;
+
+        const choice = question.choices.find((c) => c.cho_id === choId);
+        if (!choice) return res.status(400).json({ message: "กรุณาเลือกคำตอบ" });
+        const isCorrect = !!choice.cho_is_correct;
+
+        await pool.query(
+            "INSERT INTO tb_mistake_retries (mr_customer_id, mr_question_id, mr_selected_choice_id, mr_is_correct) VALUES (?, ?, ?, ?)",
+            [customerId, questionId, choId, isCorrect ? 1 : 0]
+        );
+        const payload = buildQuestionPayload(question, question.choices.map((c) => c.cho_id), { ans_selected_choice_id: choId }, true);
+        res.json({ is_correct: isCorrect, reveal: payload.reveal });
+    } catch (err) {
+        next(err);
+    }
+}
+
 // "ข้อที่ต้องทบทวน" — ข้อที่ลูกค้าเคยตอบผิด รวมทุกครั้งที่ทำ
 //
 // นี่คือจุดที่เปลี่ยนหน้าประวัติจาก "รายงานผล" เป็น "เครื่องมือฝึก" — เดิมบอกได้แค่ว่าอ่อนหมวดไหน
@@ -698,12 +863,9 @@ async function getMistakes(req, res, next) {
         // ค่าเริ่มต้นโชว์เฉพาะข้อที่ "ยังผิดอยู่" เพราะเป็นสิ่งที่ต้องลงมือทบทวนจริงๆ
         const includeResolved = req.query.include_resolved === "1";
 
-        const conditions = [
-            "att.att_customer_id = ?",
-            "att.att_status = 'submitted'",
-            "a.ans_is_correct IS NOT NULL",
-        ];
-        const params = [customerId];
+        // คนละข้อกันกับเงื่อนไขลูกค้า (อยู่ใน mistakeEventsSql แล้ว) — ที่นี่เหลือแค่ตัวกรองชุด/หัวข้อ
+        const conditions = ["1 = 1"];
+        const params = [customerId, customerId];
         if (productId) { conditions.push("q.ques_product_id = ?"); params.push(productId); }
         if (topicId) { conditions.push("q.ques_topic_id = ?"); params.push(topicId); }
 
@@ -714,15 +876,14 @@ async function getMistakes(req, res, next) {
             `SELECT * FROM (
                 SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url,
                        q.ques_product_id, p.prod_name, t.tpc_id, t.tpc_name,
-                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                       ${WRONG_COUNT_SQL} AS wrong_count,
                        COUNT(*) AS answered_count,
-                       MAX(att.att_submitted_at) AS last_answered_at,
+                       MAX(ev.answered_at) AS last_answered_at,
                        -- ผลของ "ครั้งล่าสุด" ที่ตอบข้อนี้ (ไม่ใช่ครั้งไหนก็ได้) ใช้ตัดสินว่าแก้ได้แล้วหรือยัง
                        ${LATEST_CORRECT_SQL} AS latest_correct,
-                       SUBSTRING_INDEX(GROUP_CONCAT(COALESCE(a.ans_selected_choice_id, '') ORDER BY att.att_submitted_at DESC), ',', 1) AS latest_choice_id
-                FROM tb_attempt_answers a
-                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
-                JOIN tb_questions q ON q.ques_id = a.ans_question_id
+                       SUBSTRING_INDEX(GROUP_CONCAT(COALESCE(ev.choice_id, '') ORDER BY ev.answered_at DESC), ',', 1) AS latest_choice_id
+                FROM ${mistakeEventsSql()}
+                JOIN tb_questions q ON q.ques_id = ev.question_id
                 JOIN tb_products p ON p.prod_id = q.ques_product_id
                 LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
                 WHERE ${conditions.join(" AND ")}
@@ -742,11 +903,10 @@ async function getMistakes(req, res, next) {
         const [[{ total }]] = await pool.query(
             `SELECT COUNT(*) AS total FROM (
                 SELECT q.ques_id,
-                       SUM(a.ans_is_correct = 0) AS wrong_count,
+                       ${WRONG_COUNT_SQL} AS wrong_count,
                        ${LATEST_CORRECT_SQL} AS latest_correct
-                FROM tb_attempt_answers a
-                JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
-                JOIN tb_questions q ON q.ques_id = a.ans_question_id
+                FROM ${mistakeEventsSql()}
+                JOIN tb_questions q ON q.ques_id = ev.question_id
                 WHERE ${conditions.join(" AND ")}
                 GROUP BY q.ques_id
                 ${havingSql}
@@ -998,6 +1158,9 @@ async function exportPrintableQuestions(req, res, next) {
 
 module.exports = {
     startOrResumeAttempt, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory,
-    getProductSummary, getWeakAreas, getMistakes,
-    fetchQuestionsWithChoices, fetchSampleQuestions, buildQuestionPayload, exportPrintableQuestions,
+    getProductSummary, getWeakAreas, getMistakes, getMistakePractice, retryMistake,
+    fetchQuestionsWithChoices, fetchSampleQuestions, fetchQuestionsByIds, buildQuestionPayload, exportPrintableQuestions,
+    SAMPLE_QUESTION_COUNT,
+    // สำหรับทดสอบ
+    buildReadiness, buildPace,
 };
