@@ -70,7 +70,11 @@ async function getOne(req, res, next) {
         if (!rows[0]) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
         // used_score = ผลรวมคะแนนของข้อที่ active อยู่ตอนนี้ ส่งไปให้หน้าแอดมินโชว์ตัวนับ "ใช้ไป 95/100"
         // และเตือนล่วงหน้าได้ก่อนกดบันทึกว่าคะแนนเต็มใหม่จะต่ำกว่าที่ใช้ไปแล้ว
-        res.json({ ...rows[0], used_score: await sumActiveQuestionScore(req.params.id) });
+        res.json({
+            ...rows[0],
+            used_score: await sumActiveQuestionScore(req.params.id),
+            topic_pass_percents: await listTopicPassPercents(req.params.id),
+        });
     } catch (err) {
         next(err);
     }
@@ -121,6 +125,65 @@ function validatePassPercent(prod_pass_percent) {
     return null;
 }
 const normalizePassPercent = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
+
+// เกณฑ์ผ่านรายวิชา (2026-09-16) — "วิชา" = หัวข้อของคำถามในชุด ดึงมาให้แอดมินเองจากคำถามที่ active อยู่
+// รวมหัวข้อที่เคยตั้งเกณฑ์ไว้แต่ตอนนี้ไม่มีคำถามแล้วด้วย (question_count = 0) ให้แอดมินเห็นและลบทิ้งได้ ไม่ค้างเงียบๆ
+async function listTopicPassPercents(productId) {
+    const [rows] = await pool.query(
+        `SELECT t.tpc_id, t.tpc_name, COALESCE(q.n, 0) AS question_count, ptp.ptp_pass_percent AS pass_percent
+         FROM tb_topics t
+         LEFT JOIN (
+             SELECT ques_topic_id, COUNT(*) AS n FROM tb_questions
+             WHERE ques_product_id = ? AND ques_status = 'active' GROUP BY ques_topic_id
+         ) q ON q.ques_topic_id = t.tpc_id
+         LEFT JOIN tb_product_topic_pass_percents ptp ON ptp.ptp_topic_id = t.tpc_id AND ptp.ptp_product_id = ?
+         WHERE q.n IS NOT NULL OR ptp.ptp_pass_percent IS NOT NULL
+         ORDER BY question_count DESC, t.tpc_name ASC`,
+        [productId, productId]
+    );
+    return rows.map((r) => ({ ...r, question_count: Number(r.question_count) }));
+}
+
+// รับ [{ tpc_id, pass_percent }] — pass_percent ว่าง/null = ไม่ตั้งเกณฑ์วิชานั้น · คืน error message หรือ null
+// เช็คให้ครบ (รวมว่าหัวข้อมีอยู่จริง) ก่อนเขียนอะไรลง DB — ไม่งั้นข้อมูลชุดถูกบันทึกไปครึ่งหนึ่งแล้วค่อยเด้ง error
+async function validateTopicPassPercents(list) {
+    if (!Array.isArray(list)) return "รูปแบบเกณฑ์ผ่านรายวิชาไม่ถูกต้อง";
+    const seen = new Set();
+    for (const item of list) {
+        if (!item || typeof item.tpc_id !== "string" || !item.tpc_id) return "รูปแบบเกณฑ์ผ่านรายวิชาไม่ถูกต้อง";
+        if (seen.has(item.tpc_id)) return "มีวิชาซ้ำในเกณฑ์ผ่านรายวิชา";
+        seen.add(item.tpc_id);
+        if (validatePassPercent(item.pass_percent)) return "เกณฑ์ผ่านรายวิชาต้องเป็นจำนวนเต็ม 1-100 (%) หรือเว้นว่าง";
+    }
+    const ids = list.filter((i) => normalizePassPercent(i.pass_percent) != null).map((i) => i.tpc_id);
+    if (ids.length) {
+        const [found] = await pool.query("SELECT tpc_id FROM tb_topics WHERE tpc_id IN (?)", [ids]);
+        if (found.length !== ids.length) return "ไม่พบบางวิชาในเกณฑ์ผ่านรายวิชา (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่";
+    }
+    return null;
+}
+
+// แทนที่เกณฑ์รายวิชาทั้งชุดในครั้งเดียว (ลบของเดิม + ใส่ใหม่ใน transaction) — ไม่ต้องไล่ diff ว่าวิชาไหนเพิ่ม/ลบ
+async function replaceTopicPassPercents(productId, list) {
+    const rows = list.filter((i) => normalizePassPercent(i.pass_percent) != null);
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        await conn.query("DELETE FROM tb_product_topic_pass_percents WHERE ptp_product_id = ?", [productId]);
+        if (rows.length) {
+            await conn.query(
+                "INSERT INTO tb_product_topic_pass_percents (ptp_product_id, ptp_topic_id, ptp_pass_percent) VALUES ?",
+                [rows.map((r) => [productId, r.tpc_id, normalizePassPercent(r.pass_percent)])]
+            );
+        }
+        await conn.commit();
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
+}
 
 // ไม่มี validation ราคามาก่อนเลย — ราคาติดลบหลุดเข้าไปได้ (เช่น พิมพ์ผิด) แล้วไปลดยอดรวมทั้งตะกร้าตอน
 // checkout() ผิดเพี้ยนได้ (subtotal รวมค่าติดลบเข้าไปด้วย) อนุญาต 0 ไว้เผื่อ product แจกฟรี แต่ห้ามติดลบ
@@ -207,6 +270,9 @@ async function update(req, res, next) {
         if (totalScoreError) return res.status(400).json({ message: totalScoreError });
         const passPercentError = validatePassPercent(req.body.prod_pass_percent);
         if (passPercentError) return res.status(400).json({ message: passPercentError });
+        const hasTopicPass = Object.prototype.hasOwnProperty.call(req.body, "topic_pass_percents");
+        const topicPassError = hasTopicPass ? await validateTopicPassPercents(req.body.topic_pass_percents) : null;
+        if (topicPassError) return res.status(400).json({ message: topicPassError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -242,6 +308,8 @@ async function update(req, res, next) {
                 normalizePassPercent(req.body.prod_pass_percent), req.params.id,
             ]);
         }
+        // เกณฑ์รายวิชาใช้กติกาเดียวกัน — ไม่ส่งฟิลด์มา = ไม่แตะของเดิม
+        if (hasTopicPass) await replaceTopicPassPercents(req.params.id, req.body.topic_pass_percents);
 
         res.json({ message: "แก้ไขชุดข้อสอบสำเร็จ" });
     } catch (err) {

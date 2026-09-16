@@ -453,20 +453,47 @@ async function countUnresolvedMistakes(customerId, productId) {
 // "ถ้าสอบวันนี้ ผ่านไหม" (2026-09-15) — เทียบผลใบนี้กับเกณฑ์ผ่านของชุด (prod_pass_percent, NULL = ไม่ตั้ง → null)
 // ชุดที่ใช้ระบบคะแนนเทียบ "คะแนน" (earned/max ที่ freeze ไว้) ชุดที่ไม่ใช้เทียบ "จำนวนข้อ" — ตรงกับที่ att_score คิดไว้
 // correctCount นับจาก ans_is_correct ของทุกข้อใน attempt (รวมข้อที่แอดมินปิดไปทีหลัง) ห้ามถอดจาก att_score ที่ปัดแล้ว
-function buildReadiness(attempt, passPercent, correctCount) {
-    if (passPercent == null) return null;
-    const pass = Number(passPercent);
-    const scored = attempt.att_max_score != null && Number(attempt.att_max_score) > 0;
-    if (scored) {
-        const earned = Number(attempt.att_earned_score) || 0;
-        const required = Math.round((pass / 100) * Number(attempt.att_max_score) * 100) / 100;
-        const passed = earned + 1e-9 >= required;
-        return { pass_percent: pass, passed, unit: "points", required, gap: passed ? 0 : Math.round((required - earned) * 100) / 100 };
+//
+// เกณฑ์รายวิชา (2026-09-16) — สนามสอบอย่าง ก.พ. ภาค ก ต้องผ่านทุกวิชา เกณฑ์รวมอย่างเดียวบอก "ผ่าน" ผิดได้
+// (คิดวิเคราะห์เต็มแต่อังกฤษตก) · "วิชา" = หัวข้อ ใช้ topicRows ชุดเดียวกับผลรายหมวดในหน้าเดียวกัน ตัวเลขจึงตรงกันเสมอ
+// ผ่านรวม = ผ่านทุกเกณฑ์ที่ตั้ง · วิชาที่ตั้งเกณฑ์ไว้แต่ไม่มีข้อในใบนี้ข้ามไป (ไม่มีอะไรให้ตัดสิน)
+function judgeAgainstPass(pass, unit, have, outOf) {
+    if (unit === "points") {
+        const required = Math.round((pass / 100) * outOf * 100) / 100;
+        const passed = have + 1e-9 >= required;
+        return { pass_percent: pass, passed, unit, required, gap: passed ? 0 : Math.round((required - have) * 100) / 100 };
     }
-    const total = Number(attempt.att_total_questions) || 0;
-    const required = Math.ceil((pass / 100) * total - 1e-9); // 60% ของ 15 ข้อ = 9 ข้อ, ของ 16 ข้อ = 10 ข้อ (ปัดขึ้น)
-    const passed = correctCount >= required;
-    return { pass_percent: pass, passed, unit: "questions", required, gap: passed ? 0 : required - correctCount };
+    const required = Math.ceil((pass / 100) * outOf - 1e-9); // 60% ของ 15 ข้อ = 9 ข้อ, ของ 16 ข้อ = 10 ข้อ (ปัดขึ้น)
+    const passed = have >= required;
+    return { pass_percent: pass, passed, unit, required, gap: passed ? 0 : required - have };
+}
+
+function buildReadiness(attempt, passPercent, correctCount, topicRows = [], topicPass = []) {
+    const scored = attempt.att_max_score != null && Number(attempt.att_max_score) > 0;
+    const overall = passPercent == null
+        ? null
+        : scored
+            ? judgeAgainstPass(Number(passPercent), "points", Number(attempt.att_earned_score) || 0, Number(attempt.att_max_score))
+            : judgeAgainstPass(Number(passPercent), "questions", correctCount, Number(attempt.att_total_questions) || 0);
+
+    const passByTopic = new Map(topicPass.map((t) => [t.ptp_topic_id, Number(t.ptp_pass_percent)]));
+    const subjects = topicRows
+        .filter((t) => passByTopic.has(t.tpc_id))
+        .map((t) => {
+            const unit = Number(t.scored_answers) > 0 ? "points" : "questions";
+            const result = unit === "points"
+                ? judgeAgainstPass(passByTopic.get(t.tpc_id), unit, Number(t.earned), Number(t.possible))
+                : judgeAgainstPass(passByTopic.get(t.tpc_id), unit, Number(t.correct), Number(t.total));
+            return { tpc_id: t.tpc_id, tpc_name: t.tpc_name, percent: Math.round((Number(t.earned) / Number(t.possible)) * 100), ...result };
+        })
+        .sort((a, b) => a.tpc_name.localeCompare(b.tpc_name, "th"));
+
+    if (!overall && subjects.length === 0) return null;
+    return {
+        passed: (!overall || overall.passed) && subjects.every((s) => s.passed),
+        overall,
+        subjects,
+    };
 }
 
 // เวลาเฉลี่ยต่อข้อเทียบกับเวลาที่ชุดกำหนด — เฉพาะโหมดจับเวลา (โหมดฝึกนับเวลาอ่านเฉลยรวมไปด้วย เทียบไม่ได้)
@@ -544,6 +571,11 @@ async function getReview(req, res, next) {
             [attempt.att_id]
         );
 
+        const [topicPass] = await pool.query(
+            "SELECT ptp_topic_id, ptp_pass_percent FROM tb_product_topic_pass_percents WHERE ptp_product_id = ?",
+            [attempt.att_product_id]
+        );
+
         // คะแนนครั้งก่อนของชุดเดียวกัน (ที่ส่งคำตอบแล้วและเกิดก่อนใบนี้) — ใช้บอกว่าดีขึ้นหรือแย่ลง
         // เทียบกับ "ครั้งก่อน" ไม่ใช่ "ดีที่สุด" เพราะสิ่งที่ผู้ใช้อยากรู้ทันทีคือรอบนี้พัฒนาขึ้นไหม
         const [[prev]] = await pool.query(
@@ -570,7 +602,9 @@ async function getReview(req, res, next) {
             // จำนวนข้อของชุดนี้ที่ยังตอบผิดอยู่ (นับข้ามทุกครั้งที่ทำ ไม่ใช่เฉพาะใบนี้) — ใช้กับปุ่มไปหน้าทบทวน
             mistake_count: await countUnresolvedMistakes(req.customer.cus_id, attempt.att_product_id),
             // null = ชุดนี้ไม่ได้ตั้งเกณฑ์ผ่าน / ไม่ใช่โหมดจับเวลา — หน้าเว็บซ่อนส่วนนั้นไปเลย
-            readiness: buildReadiness(attempt, product?.prod_pass_percent, answers.filter((a) => a.ans_is_correct).length),
+            readiness: buildReadiness(
+                attempt, product?.prod_pass_percent, answers.filter((a) => a.ans_is_correct).length, topicRows, topicPass
+            ),
             pace: buildPace(attempt),
             topic_breakdown: topicRows.map((t) => ({
                 tpc_id: t.tpc_id,
