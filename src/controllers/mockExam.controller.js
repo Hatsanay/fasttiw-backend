@@ -55,12 +55,14 @@ const withNumbers = (r) => ({
 // (ของลูกค้าแต่ละคนจะน้อยกว่านี้ เพราะเห็นเฉพาะชุดที่ตัวเองมีสิทธิ์ — ดู buildSectionPools)
 async function listSections(examId) {
     const [rows] = await pool.query(
-        `SELECT s.mes_topic_id, t.tpc_name, s.mes_question_count, s.mes_pass_percent, s.mes_pass_min, s.mes_order,
+        `SELECT s.mes_topic_id, t.tpc_name, c.cat_name AS tpc_category_name,
+                s.mes_question_count, s.mes_pass_percent, s.mes_pass_min, s.mes_order,
                 (SELECT COUNT(*) FROM tb_questions q
                   JOIN tb_products p ON p.prod_id = q.ques_product_id
                   WHERE q.ques_topic_id = s.mes_topic_id AND q.ques_status = 'active' AND p.prod_status = 'published') AS available
          FROM tb_mock_exam_sections s
          JOIN tb_topics t ON t.tpc_id = s.mes_topic_id
+         LEFT JOIN tb_categories c ON c.cat_id = t.tpc_category_id
          WHERE s.mes_exam_id = ?
          ORDER BY s.mes_order ASC, t.tpc_name ASC`,
         [examId]
@@ -68,6 +70,7 @@ async function listSections(examId) {
     return rows.map((r) => ({
         tpc_id: r.mes_topic_id,
         tpc_name: r.tpc_name,
+        tpc_category_name: r.tpc_category_name,
         question_count: Number(r.mes_question_count),
         pass_percent: r.mes_pass_percent,
         pass_min: r.mes_pass_min == null ? null : Number(r.mes_pass_min),
