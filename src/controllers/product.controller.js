@@ -59,7 +59,7 @@ async function getOne(req, res, next) {
         const [rows] = await pool.query(
             `SELECT p.prod_id, p.prod_name, p.prod_description, p.prod_price, p.prod_compare_price, p.prod_is_free, p.prod_cover_url, p.prod_status,
                     p.prod_category_id, p.prod_commission_staff_id, p.prod_commission_type, p.prod_commission_value,
-                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score, p.prod_pass_percent,
+                    p.prod_exam_duration_minutes, p.prod_entitlement_duration_months, p.prod_total_score, p.prod_pass_percent, p.prod_pass_min,
                     p.prod_created_at, p.prod_updated_at,
                     c.cat_name AS prod_category_name
              FROM tb_products p
@@ -73,7 +73,7 @@ async function getOne(req, res, next) {
         res.json({
             ...rows[0],
             used_score: await sumActiveQuestionScore(req.params.id),
-            topic_pass_percents: await listTopicPassPercents(req.params.id),
+            topic_pass_criteria: await listTopicPassCriteria(req.params.id),
         });
     } catch (err) {
         next(err);
@@ -117,45 +117,73 @@ function validateEntitlementDuration(prod_entitlement_duration_months) {
     return null;
 }
 
-// เกณฑ์ผ่าน (%) — ไม่บังคับ ว่าง/ไม่ส่ง = ไม่ตั้งเกณฑ์ (หน้าผลลูกค้าไม่แสดงผ่าน/ไม่ผ่าน) ตั้งได้ 1-100 จำนวนเต็ม
-function validatePassPercent(prod_pass_percent) {
-    if (prod_pass_percent === undefined || prod_pass_percent === null || prod_pass_percent === "") return null;
-    const value = Number(prod_pass_percent);
-    if (!Number.isInteger(value) || value < 1 || value > 100) return "เกณฑ์ผ่านต้องเป็นจำนวนเต็ม 1-100 (%) หรือเว้นว่างถ้าไม่ตั้งเกณฑ์";
+// เกณฑ์ผ่าน — ไม่บังคับ ว่าง/ไม่ส่ง = ไม่ตั้งเกณฑ์ (หน้าผลลูกค้าไม่แสดงผ่าน/ไม่ผ่าน)
+// กำหนดได้ 2 แบบ ใส่อย่างใดอย่างหนึ่ง (2026-09-16):
+//   percent = % จำนวนเต็ม 1-100
+//   min     = ขั้นต่ำ — "จำนวนข้อ" (จำนวนเต็ม) ถ้าชุดไม่ใช้ระบบคะแนน / "คะแนน" (ทศนิยม 2 ตำแหน่ง) ถ้าใช้
+//             สนามสอบหลายแห่งประกาศเกณฑ์เป็นจำนวนข้อ แปลงเป็น % เองแล้วปัดเศษเพี้ยนได้
+const isBlank = (v) => v === undefined || v === null || v === "";
+const normalizePassValue = (v) => (isBlank(v) ? null : Number(v));
+const MAX_PASS_MIN = 99999.99;
+
+function validatePassPercent(value) {
+    if (isBlank(value)) return null;
+    const num = Number(value);
+    if (!Number.isInteger(num) || num < 1 || num > 100) return "แบบ % ต้องเป็นจำนวนเต็ม 1-100 หรือเว้นว่างถ้าไม่ตั้งเกณฑ์";
     return null;
 }
-const normalizePassPercent = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
+
+// คืน error message หรือ null — label บอกว่าเกณฑ์ไหนผิด ("เกณฑ์ผ่านรวม" / "เกณฑ์ผ่านรายวิชา")
+function validatePassCriterion({ percent, min }, scored, label) {
+    if (!isBlank(percent) && !isBlank(min)) return `${label}: เลือกกำหนดเป็น % หรือขั้นต่ำอย่างใดอย่างหนึ่ง`;
+    const percentError = validatePassPercent(percent);
+    if (percentError) return `${label}: ${percentError}`;
+    if (isBlank(min)) return null;
+    const num = Number(min);
+    if (!Number.isFinite(num) || num <= 0 || num > MAX_PASS_MIN) return `${label}: ขั้นต่ำต้องมากกว่า 0`;
+    if (!scored && !Number.isInteger(num)) return `${label}: จำนวนข้อขั้นต่ำต้องเป็นจำนวนเต็ม`;
+    if (scored && Math.abs(Math.round(num * 100) - num * 100) > 1e-6) return `${label}: คะแนนขั้นต่ำมีทศนิยมได้ไม่เกิน 2 ตำแหน่ง`;
+    return null;
+}
 
 // เกณฑ์ผ่านรายวิชา (2026-09-16) — "วิชา" = หัวข้อของคำถามในชุด ดึงมาให้แอดมินเองจากคำถามที่ active อยู่
 // รวมหัวข้อที่เคยตั้งเกณฑ์ไว้แต่ตอนนี้ไม่มีคำถามแล้วด้วย (question_count = 0) ให้แอดมินเห็นและลบทิ้งได้ ไม่ค้างเงียบๆ
-async function listTopicPassPercents(productId) {
+async function listTopicPassCriteria(productId) {
     const [rows] = await pool.query(
-        `SELECT t.tpc_id, t.tpc_name, COALESCE(q.n, 0) AS question_count, ptp.ptp_pass_percent AS pass_percent
+        `SELECT t.tpc_id, t.tpc_name, COALESCE(q.n, 0) AS question_count,
+                ptp.ptp_pass_percent AS pass_percent, ptp.ptp_pass_min AS pass_min
          FROM tb_topics t
          LEFT JOIN (
              SELECT ques_topic_id, COUNT(*) AS n FROM tb_questions
              WHERE ques_product_id = ? AND ques_status = 'active' GROUP BY ques_topic_id
          ) q ON q.ques_topic_id = t.tpc_id
-         LEFT JOIN tb_product_topic_pass_percents ptp ON ptp.ptp_topic_id = t.tpc_id AND ptp.ptp_product_id = ?
-         WHERE q.n IS NOT NULL OR ptp.ptp_pass_percent IS NOT NULL
+         LEFT JOIN tb_product_topic_pass_criteria ptp ON ptp.ptp_topic_id = t.tpc_id AND ptp.ptp_product_id = ?
+         WHERE q.n IS NOT NULL OR ptp.ptp_topic_id IS NOT NULL
          ORDER BY question_count DESC, t.tpc_name ASC`,
         [productId, productId]
     );
-    return rows.map((r) => ({ ...r, question_count: Number(r.question_count) }));
+    return rows.map((r) => ({
+        ...r,
+        question_count: Number(r.question_count),
+        pass_min: r.pass_min == null ? null : Number(r.pass_min),
+    }));
 }
 
-// รับ [{ tpc_id, pass_percent }] — pass_percent ว่าง/null = ไม่ตั้งเกณฑ์วิชานั้น · คืน error message หรือ null
+const hasTopicCriterion = (i) => !isBlank(i.pass_percent) || !isBlank(i.pass_min);
+
+// รับ [{ tpc_id, pass_percent, pass_min }] — ว่างทั้งคู่ = ไม่ตั้งเกณฑ์วิชานั้น · คืน error message หรือ null
 // เช็คให้ครบ (รวมว่าหัวข้อมีอยู่จริง) ก่อนเขียนอะไรลง DB — ไม่งั้นข้อมูลชุดถูกบันทึกไปครึ่งหนึ่งแล้วค่อยเด้ง error
-async function validateTopicPassPercents(list) {
+async function validateTopicPassCriteria(list, scored) {
     if (!Array.isArray(list)) return "รูปแบบเกณฑ์ผ่านรายวิชาไม่ถูกต้อง";
     const seen = new Set();
     for (const item of list) {
         if (!item || typeof item.tpc_id !== "string" || !item.tpc_id) return "รูปแบบเกณฑ์ผ่านรายวิชาไม่ถูกต้อง";
         if (seen.has(item.tpc_id)) return "มีวิชาซ้ำในเกณฑ์ผ่านรายวิชา";
         seen.add(item.tpc_id);
-        if (validatePassPercent(item.pass_percent)) return "เกณฑ์ผ่านรายวิชาต้องเป็นจำนวนเต็ม 1-100 (%) หรือเว้นว่าง";
+        const error = validatePassCriterion({ percent: item.pass_percent, min: item.pass_min }, scored, "เกณฑ์ผ่านรายวิชา");
+        if (error) return error;
     }
-    const ids = list.filter((i) => normalizePassPercent(i.pass_percent) != null).map((i) => i.tpc_id);
+    const ids = list.filter(hasTopicCriterion).map((i) => i.tpc_id);
     if (ids.length) {
         const [found] = await pool.query("SELECT tpc_id FROM tb_topics WHERE tpc_id IN (?)", [ids]);
         if (found.length !== ids.length) return "ไม่พบบางวิชาในเกณฑ์ผ่านรายวิชา (อาจถูกลบไปแล้ว) กรุณาโหลดหน้าใหม่";
@@ -164,16 +192,16 @@ async function validateTopicPassPercents(list) {
 }
 
 // แทนที่เกณฑ์รายวิชาทั้งชุดในครั้งเดียว (ลบของเดิม + ใส่ใหม่ใน transaction) — ไม่ต้องไล่ diff ว่าวิชาไหนเพิ่ม/ลบ
-async function replaceTopicPassPercents(productId, list) {
-    const rows = list.filter((i) => normalizePassPercent(i.pass_percent) != null);
+async function replaceTopicPassCriteria(productId, list) {
+    const rows = list.filter(hasTopicCriterion);
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
-        await conn.query("DELETE FROM tb_product_topic_pass_percents WHERE ptp_product_id = ?", [productId]);
+        await conn.query("DELETE FROM tb_product_topic_pass_criteria WHERE ptp_product_id = ?", [productId]);
         if (rows.length) {
             await conn.query(
-                "INSERT INTO tb_product_topic_pass_percents (ptp_product_id, ptp_topic_id, ptp_pass_percent) VALUES ?",
-                [rows.map((r) => [productId, r.tpc_id, normalizePassPercent(r.pass_percent)])]
+                "INSERT INTO tb_product_topic_pass_criteria (ptp_product_id, ptp_topic_id, ptp_pass_percent, ptp_pass_min) VALUES ?",
+                [rows.map((r) => [productId, r.tpc_id, normalizePassValue(r.pass_percent), normalizePassValue(r.pass_min)])]
             );
         }
         await conn.commit();
@@ -211,7 +239,7 @@ async function create(req, res, next) {
         const {
             prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id,
             prod_commission_staff_id, prod_commission_type, prod_commission_value,
-            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score, prod_pass_percent,
+            prod_exam_duration_minutes, prod_entitlement_duration_months, prod_total_score, prod_pass_percent, prod_pass_min,
         } = req.body;
         if (!prod_name) return res.status(400).json({ message: "กรุณากรอกชื่อชุดข้อสอบ" });
 
@@ -223,8 +251,10 @@ async function create(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const totalScoreError = validateTotalScore(prod_total_score);
         if (totalScoreError) return res.status(400).json({ message: totalScoreError });
-        const passPercentError = validatePassPercent(prod_pass_percent);
-        if (passPercentError) return res.status(400).json({ message: passPercentError });
+        const passError = validatePassCriterion(
+            { percent: prod_pass_percent, min: prod_pass_min }, normalizeTotalScore(prod_total_score) != null, "เกณฑ์ผ่านรวม"
+        );
+        if (passError) return res.status(400).json({ message: passError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
         const comparePriceError = validateComparePrice(prod_compare_price, prod_price);
@@ -235,13 +265,13 @@ async function create(req, res, next) {
             `INSERT INTO tb_products
                 (prod_id, prod_name, prod_description, prod_price, prod_compare_price, prod_is_free, prod_category_id, prod_created_by_id,
                  prod_commission_staff_id, prod_commission_type, prod_commission_value, prod_exam_duration_minutes,
-                 prod_entitlement_duration_months, prod_total_score, prod_pass_percent)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 prod_entitlement_duration_months, prod_total_score, prod_pass_percent, prod_pass_min)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 prod_id, prod_name, prod_description || null, prod_price || 0, prod_compare_price || null, !!prod_is_free, prod_category_id || null, req.user.user_id,
                 prod_commission_staff_id || null, prod_commission_type || null, prod_commission_value || null,
                 prod_exam_duration_minutes || 60, prod_entitlement_duration_months || null, normalizeTotalScore(prod_total_score),
-                normalizePassPercent(prod_pass_percent),
+                normalizePassValue(prod_pass_percent), normalizePassValue(prod_pass_min),
             ]
         );
 
@@ -268,10 +298,11 @@ async function update(req, res, next) {
         if (entitlementDurationError) return res.status(400).json({ message: entitlementDurationError });
         const totalScoreError = validateTotalScore(prod_total_score);
         if (totalScoreError) return res.status(400).json({ message: totalScoreError });
-        const passPercentError = validatePassPercent(req.body.prod_pass_percent);
-        if (passPercentError) return res.status(400).json({ message: passPercentError });
-        const hasTopicPass = Object.prototype.hasOwnProperty.call(req.body, "topic_pass_percents");
-        const topicPassError = hasTopicPass ? await validateTopicPassPercents(req.body.topic_pass_percents) : null;
+        const scored = normalizeTotalScore(prod_total_score) != null;
+        const passError = validatePassCriterion({ percent: req.body.prod_pass_percent, min: req.body.prod_pass_min }, scored, "เกณฑ์ผ่านรวม");
+        if (passError) return res.status(400).json({ message: passError });
+        const hasTopicPass = Object.prototype.hasOwnProperty.call(req.body, "topic_pass_criteria");
+        const topicPassError = hasTopicPass ? await validateTopicPassCriteria(req.body.topic_pass_criteria, scored) : null;
         if (topicPassError) return res.status(400).json({ message: topicPassError });
         const priceError = validatePrice(prod_price);
         if (priceError) return res.status(400).json({ message: priceError });
@@ -301,15 +332,24 @@ async function update(req, res, next) {
                 req.params.id,
             ]
         );
-        // เกณฑ์ผ่านเปลี่ยนเฉพาะตอนส่งฟิลด์นี้มาจริง — หน้าจอ/สคริปต์ที่ไม่รู้จักฟิลด์นี้ (เช่น JS แอดมินรุ่นเก่า
+        // เกณฑ์ผ่านเปลี่ยนเฉพาะตอนส่งฟิลด์มาจริง — หน้าจอ/สคริปต์ที่ไม่รู้จักฟิลด์ (เช่น JS แอดมินรุ่นเก่า
         // ที่ค้างในเบราว์เซอร์หลัง deploy) กดบันทึกแล้วต้องไม่ลบเกณฑ์ที่ตั้งไว้ทิ้งเงียบๆ
-        if (Object.prototype.hasOwnProperty.call(req.body, "prod_pass_percent")) {
-            await pool.query("UPDATE tb_products SET prod_pass_percent = ? WHERE prod_id = ?", [
-                normalizePassPercent(req.body.prod_pass_percent), req.params.id,
+        // รุ่นที่รู้จักแค่ % (ไม่ส่ง prod_pass_min): ตั้ง % = ล้างขั้นต่ำ (ใช้ได้ทีละแบบ) · ส่ง % ว่าง = ไม่แตะขั้นต่ำ
+        const has = (key) => Object.prototype.hasOwnProperty.call(req.body, key);
+        if (has("prod_pass_min")) {
+            await pool.query("UPDATE tb_products SET prod_pass_percent = ?, prod_pass_min = ? WHERE prod_id = ?", [
+                normalizePassValue(req.body.prod_pass_percent), normalizePassValue(req.body.prod_pass_min), req.params.id,
             ]);
+        } else if (has("prod_pass_percent")) {
+            const percent = normalizePassValue(req.body.prod_pass_percent);
+            if (percent == null) {
+                await pool.query("UPDATE tb_products SET prod_pass_percent = NULL WHERE prod_id = ?", [req.params.id]);
+            } else {
+                await pool.query("UPDATE tb_products SET prod_pass_percent = ?, prod_pass_min = NULL WHERE prod_id = ?", [percent, req.params.id]);
+            }
         }
         // เกณฑ์รายวิชาใช้กติกาเดียวกัน — ไม่ส่งฟิลด์มา = ไม่แตะของเดิม
-        if (hasTopicPass) await replaceTopicPassPercents(req.params.id, req.body.topic_pass_percents);
+        if (hasTopicPass) await replaceTopicPassCriteria(req.params.id, req.body.topic_pass_criteria);
 
         res.json({ message: "แก้ไขชุดข้อสอบสำเร็จ" });
     } catch (err) {
