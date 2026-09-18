@@ -5,6 +5,8 @@ const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { resolveUploadPath } = require("../utils/uploads");
 const { validateTotalScore, normalizeTotalScore, checkScoreBudget, sumActiveQuestionScore } = require("../utils/scoring");
+// เกณฑ์ผ่านของชุดข้อสอบ/รายวิชา ใช้กติกาเดียวกับสนามสอบเสมือน — ดู utils/passCriteria.js
+const { isBlank, normalizePassValue, validatePassCriterion } = require("../utils/passCriteria");
 
 const PRODUCT_COVER_DIR = path.join(__dirname, "..", "..", "uploads", "products");
 
@@ -114,35 +116,6 @@ function validateEntitlementDuration(prod_entitlement_duration_months) {
     }
     const value = Number(prod_entitlement_duration_months);
     if (!Number.isInteger(value) || value < 1 || value > 120) return "ระยะเวลาสิทธิ์ต้องเป็นจำนวนเต็ม 1-120 เดือน";
-    return null;
-}
-
-// เกณฑ์ผ่าน — ไม่บังคับ ว่าง/ไม่ส่ง = ไม่ตั้งเกณฑ์ (หน้าผลลูกค้าไม่แสดงผ่าน/ไม่ผ่าน)
-// กำหนดได้ 2 แบบ ใส่อย่างใดอย่างหนึ่ง (2026-09-16):
-//   percent = % จำนวนเต็ม 1-100
-//   min     = ขั้นต่ำ — "จำนวนข้อ" (จำนวนเต็ม) ถ้าชุดไม่ใช้ระบบคะแนน / "คะแนน" (ทศนิยม 2 ตำแหน่ง) ถ้าใช้
-//             สนามสอบหลายแห่งประกาศเกณฑ์เป็นจำนวนข้อ แปลงเป็น % เองแล้วปัดเศษเพี้ยนได้
-const isBlank = (v) => v === undefined || v === null || v === "";
-const normalizePassValue = (v) => (isBlank(v) ? null : Number(v));
-const MAX_PASS_MIN = 99999.99;
-
-function validatePassPercent(value) {
-    if (isBlank(value)) return null;
-    const num = Number(value);
-    if (!Number.isInteger(num) || num < 1 || num > 100) return "แบบ % ต้องเป็นจำนวนเต็ม 1-100 หรือเว้นว่างถ้าไม่ตั้งเกณฑ์";
-    return null;
-}
-
-// คืน error message หรือ null — label บอกว่าเกณฑ์ไหนผิด ("เกณฑ์ผ่านรวม" / "เกณฑ์ผ่านรายวิชา")
-function validatePassCriterion({ percent, min }, scored, label) {
-    if (!isBlank(percent) && !isBlank(min)) return `${label}: เลือกกำหนดเป็น % หรือขั้นต่ำอย่างใดอย่างหนึ่ง`;
-    const percentError = validatePassPercent(percent);
-    if (percentError) return `${label}: ${percentError}`;
-    if (isBlank(min)) return null;
-    const num = Number(min);
-    if (!Number.isFinite(num) || num <= 0 || num > MAX_PASS_MIN) return `${label}: ขั้นต่ำต้องมากกว่า 0`;
-    if (!scored && !Number.isInteger(num)) return `${label}: จำนวนข้อขั้นต่ำต้องเป็นจำนวนเต็ม`;
-    if (scored && Math.abs(Math.round(num * 100) - num * 100) > 1e-6) return `${label}: คะแนนขั้นต่ำมีทศนิยมได้ไม่เกิน 2 ตำแหน่ง`;
     return null;
 }
 

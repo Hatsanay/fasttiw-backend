@@ -1,4 +1,6 @@
 const pool = require("../config/db");
+const { toCriterion, judgeAgainstPass } = require("../utils/passCriteria");
+const { pickQuestions } = require("./mockExam.controller");
 const { generateId, generateIds } = require("../utils/generateId");
 const { hasActiveEntitlement } = require("./entitlement.controller");
 
@@ -113,6 +115,23 @@ async function buildQuestionMap(questions) {
 // ข้อ 7) ระหว่างที่ attempt ยัง in_progress ค้างอยู่ ลูกค้าจะยังตอบ/ส่ง/ดูเฉลยต่อได้ตามปกติไม่จำกัด ทั้งที่ไม่
 // ควรเข้าถึงเนื้อหานี้แล้ว — ไม่ใช้กับ abandonAttempt เพราะเป็นแค่การล้าง state ไม่ได้เปิดเผยเนื้อหา/ให้
 // ประโยชน์อะไรเพิ่ม ปล่อยให้ยกเลิกได้เสมอไม่ว่าสิทธิ์จะเป็นอย่างไร
+// ใบสนามสอบเสมือนไม่ได้ผูกกับชุดเดียว (ข้อมาจากหลายชุด) — ใช้กติกา "ยังต้องมีสิทธิ์ชุดใดชุดหนึ่งอยู่จริง"
+// ถ้าสิทธิ์หมดทุกชุดแล้วต้องเข้าไม่ได้เหมือนกัน ไม่งั้นใบเก่าจะกลายเป็นช่องดูเฉลยฟรีถาวรหลังหมดอายุ
+async function requireStillEntitledForAttempt(customerId, attempt, res) {
+    if (!attempt.att_mock_exam_id) return requireStillEntitled(customerId, attempt.att_product_id, res);
+    const [rows] = await pool.query(
+        `SELECT 1 FROM tb_entitlements
+         WHERE ent_customer_id = ? AND ent_status = 'active' AND (ent_expires_at IS NULL OR ent_expires_at > NOW())
+         LIMIT 1`,
+        [customerId]
+    );
+    if (!rows.length) {
+        res.status(403).json({ message: "สิทธิ์เข้าถึงชุดข้อสอบของคุณหมดอายุหรือถูกยกเลิกไปแล้ว" });
+        return false;
+    }
+    return true;
+}
+
 async function requireStillEntitled(customerId, productId, res) {
     const hasAccess = await hasActiveEntitlement(customerId, productId);
     if (!hasAccess) {
@@ -126,7 +145,7 @@ async function requireStillEntitled(customerId, productId, res) {
 // 403 กันคนเดา attempt id ของคนอื่นแล้วรู้ว่ามี id นี้จริง)
 async function loadOwnAttempt(attemptId, customerId) {
     const [rows] = await pool.query(
-        `SELECT att_id, att_customer_id, att_product_id, att_mode, att_status, att_question_order,
+        `SELECT att_id, att_customer_id, att_product_id, att_mock_exam_id, att_mode, att_status, att_question_order,
                 att_score, att_earned_score, att_max_score, att_total_questions,
                 att_time_limit_minutes, att_started_at, att_submitted_at
          FROM tb_attempts WHERE att_id = ? AND att_customer_id = ?`,
@@ -162,6 +181,8 @@ async function buildAttemptResponse(attempt) {
     return {
         att_id: attempt.att_id,
         att_product_id: attempt.att_product_id,
+        // ใบสนามสอบเสมือน — หน้าทำข้อสอบใช้บอกว่ากำลังสอบสนามไหนอยู่ (ไม่มีชื่อชุดข้อสอบให้แสดง)
+        att_mock_exam_id: attempt.att_mock_exam_id ?? null,
         att_mode: attempt.att_mode,
         att_status: attempt.att_status,
         att_score: attempt.att_score,
@@ -277,11 +298,87 @@ async function startOrResumeAttempt(req, res, next) {
     }
 }
 
+// เริ่ม/ทำต่อ "สนามสอบเสมือนจริง" (2026-09-18) — ต่างจาก startOrResumeAttempt ตรงที่ข้อมาจากหลายชุด
+// ตามโควตารายวิชาที่แอดมินตั้งไว้ ดู mockExam.controller.js · ใบนี้เป็นโหมดจับเวลาเสมอ (จำลองสนามจริง)
+// และไม่ใช้ระบบคะแนนรายข้อ (att_max_score = NULL) เพราะข้อมาจากชุดที่ตั้งคะแนนกันคนละแบบ
+async function startMockAttempt(req, res, next) {
+    try {
+        const examId = req.params.id;
+        const [[exam]] = await pool.query(
+            "SELECT me_id, me_time_limit_minutes FROM tb_mock_exams WHERE me_id = ? AND me_status = 'published'",
+            [examId]
+        );
+        if (!exam) return res.status(404).json({ message: "ไม่พบสนามสอบนี้" });
+
+        const resumeExisting = async () => {
+            const [rows] = await pool.query(
+                "SELECT att_id FROM tb_attempts WHERE att_customer_id = ? AND att_mock_exam_id = ? AND att_status = 'in_progress' LIMIT 1",
+                [req.customer.cus_id, examId]
+            );
+            if (!rows[0]) return null;
+            return buildAttemptResponse(await loadOwnAttempt(rows[0].att_id, req.customer.cus_id));
+        };
+        const resumed = await resumeExisting();
+        if (resumed) return res.json(resumed);
+
+        const [sections] = await pool.query(
+            "SELECT mes_topic_id, mes_question_count FROM tb_mock_exam_sections WHERE mes_exam_id = ? ORDER BY mes_order ASC",
+            [examId]
+        );
+        if (!sections.length) return res.status(400).json({ message: "สนามสอบนี้ยังไม่ได้ตั้งวิชา" });
+
+        // สุ่มใหม่ทุกครั้งที่เริ่ม จากชุดที่ลูกค้ามีสิทธิ์ ณ ตอนนี้ — ข้อที่ได้จึง snapshot ไว้ที่ att_question_order
+        // เหมือนการทำข้อสอบปกติ (สิทธิ์หมดอายุระหว่างทำ ไม่ทำให้ชุดคำถามเปลี่ยนกลางอากาศ)
+        const questionIds = await pickQuestions(req.customer.cus_id, sections);
+        if (!questionIds.length) {
+            return res.status(403).json({ message: "คุณยังไม่มีสิทธิ์ในชุดข้อสอบที่ใช้ในสนามสอบนี้" });
+        }
+        const questionMap = await fetchQuestionsByIds(questionIds);
+
+        const conn = await pool.getConnection();
+        try {
+            await conn.beginTransaction();
+            const att_id = await generateId("tb_attempts", "ATT");
+            await conn.query(
+                `INSERT INTO tb_attempts
+                    (att_id, att_customer_id, att_product_id, att_mock_exam_id, att_mode, att_question_order,
+                     att_max_score, att_total_questions, att_time_limit_minutes)
+                 VALUES (?, ?, NULL, ?, 'timed', ?, NULL, ?, ?)`,
+                [att_id, req.customer.cus_id, examId, JSON.stringify(questionIds), questionIds.length, exam.me_time_limit_minutes]
+            );
+            const answerIds = await generateIds("tb_attempt_answers", "ANS", questionIds.length);
+            await conn.query(
+                "INSERT INTO tb_attempt_answers (ans_id, ans_attempt_id, ans_question_id, ans_choice_order, ans_score) VALUES ?",
+                [questionIds.map((quesId, i) => [
+                    answerIds[i], att_id, quesId, JSON.stringify(questionMap[quesId].choices.map((c) => c.cho_id)), null,
+                ])]
+            );
+            await conn.commit();
+            res.status(201).json(await buildAttemptResponse(await loadOwnAttempt(att_id, req.customer.cus_id)));
+        } catch (err) {
+            await conn.rollback();
+            throw err;
+        } finally {
+            conn.release();
+        }
+    } catch (err) {
+        // แพ้ race ให้คำขอที่มาถึงก่อน (กดสองแท็บ/ดับเบิลคลิก) — ไปทำต่อใบที่ชนะสร้างไว้ เหมือน startOrResumeAttempt
+        if (err.code === "ER_DUP_ENTRY" && err.sqlMessage?.includes("uniq_att_in_progress")) {
+            const [rows] = await pool.query(
+                "SELECT att_id FROM tb_attempts WHERE att_customer_id = ? AND att_mock_exam_id = ? AND att_status = 'in_progress' LIMIT 1",
+                [req.customer.cus_id, req.params.id]
+            );
+            if (rows[0]) return res.json(await buildAttemptResponse(await loadOwnAttempt(rows[0].att_id, req.customer.cus_id)));
+        }
+        next(err);
+    }
+}
+
 async function getAttempt(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
-        if (!(await requireStillEntitled(req.customer.cus_id, attempt.att_product_id, res))) return;
+        if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
         res.json(await buildAttemptResponse(attempt));
     } catch (err) {
         next(err);
@@ -292,7 +389,7 @@ async function submitAnswer(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
-        if (!(await requireStillEntitled(req.customer.cus_id, attempt.att_product_id, res))) return;
+        if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
         if (attempt.att_status !== "in_progress") {
             return res.status(400).json({ message: "ทำข้อสอบชุดนี้เสร็จไปแล้ว" });
         }
@@ -340,7 +437,7 @@ async function submitAttempt(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
-        if (!(await requireStillEntitled(req.customer.cus_id, attempt.att_product_id, res))) return;
+        if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
         if (attempt.att_status !== "in_progress") {
             return res.status(400).json({ message: "ทำข้อสอบชุดนี้เสร็จไปแล้ว" });
         }
@@ -417,10 +514,11 @@ async function abandonAttempt(req, res, next) {
 // ทุก query ที่ตัดสินว่า "ต้องทบทวนไหม" ต้องอ่านผ่าน mistakeEventsSql() เท่านั้น ห้ามกลับไป JOIN คำตอบเอง
 // ใส่ customer filter ในแต่ละฝั่งของ UNION เอง (ไม่พึ่ง optimizer ดันเงื่อนไขเข้า derived table) → params [cid, cid]
 const mistakeEventsSql = () => `(
-    SELECT a.ans_question_id AS question_id, att.att_product_id AS product_id, a.ans_is_correct AS is_correct,
+    SELECT a.ans_question_id AS question_id, q.ques_product_id AS product_id, a.ans_is_correct AS is_correct,
            a.ans_selected_choice_id AS choice_id, att.att_submitted_at AS answered_at
     FROM tb_attempt_answers a
     JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
+    JOIN tb_questions q ON q.ques_id = a.ans_question_id
     WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
     UNION ALL
     SELECT r.mr_question_id, q.ques_product_id, r.mr_is_correct, r.mr_selected_choice_id, r.mr_created_at
@@ -441,11 +539,11 @@ async function countUnresolvedMistakes(customerId, productId) {
             SELECT ${WRONG_COUNT_SQL} AS wrong_count,
                    ${LATEST_CORRECT_SQL} AS latest_correct
             FROM ${mistakeEventsSql()}
-            WHERE ev.product_id = ?
+            ${productId ? "WHERE ev.product_id = ?" : ""}
             GROUP BY ev.question_id
             ${UNRESOLVED_MISTAKE_HAVING}
          ) m`,
-        [customerId, customerId, productId]
+        productId ? [customerId, customerId, productId] : [customerId, customerId]
     );
     return Number(row.total);
 }
@@ -461,34 +559,6 @@ async function countUnresolvedMistakes(customerId, productId) {
 // เกณฑ์แบบขั้นต่ำ (2026-09-16) — criterion = { percent } หรือ { min } อย่างใดอย่างหนึ่ง (null ทั้งคู่ = ไม่ตั้ง)
 // min คือ "ข้อ" หรือ "คะแนน" ตามหน่วยของใบนี้ (unit) · pass_percent ที่ส่งกลับ = ตำแหน่งเส้นเกณฑ์บนแถบ (0-100)
 // ใบที่มีข้อน้อยกว่าขั้นต่ำ (แอดมินลดข้อทีหลัง) ต้องการ = ขั้นต่ำเดิม ไม่ตัดลง — ผ่านไม่ได้ ตรงกับเกณฑ์ที่ประกาศไว้
-const toCriterion = (percent, min) =>
-    percent != null ? { percent: Number(percent) } : min != null ? { min: Number(min) } : null;
-
-function judgeAgainstPass(criterion, unit, have, outOf) {
-    const round2 = (n) => Math.round(n * 100) / 100;
-    let required;
-    if (criterion.min != null) {
-        required = unit === "points" ? round2(criterion.min) : Math.ceil(criterion.min - 1e-9);
-    } else if (unit === "points") {
-        required = round2((criterion.percent / 100) * outOf);
-    } else {
-        required = Math.ceil((criterion.percent / 100) * outOf - 1e-9); // 60% ของ 15 ข้อ = 9 ข้อ, ของ 16 ข้อ = 10 ข้อ (ปัดขึ้น)
-    }
-    const passed = unit === "points" ? have + 1e-9 >= required : have >= required;
-    return {
-        mode: criterion.min != null ? "min" : "percent",
-        pass_percent: criterion.min != null
-            ? (outOf > 0 ? Math.min(100, Math.round((required / outOf) * 1000) / 10) : 100)
-            : criterion.percent,
-        passed,
-        unit,
-        required,
-        have: round2(have),
-        out_of: round2(outOf),
-        gap: passed ? 0 : round2(required - have),
-    };
-}
-
 function buildReadiness(attempt, criterion, correctCount, topicRows = [], topicCriteria = []) {
     const scored = attempt.att_max_score != null && Number(attempt.att_max_score) > 0;
     const overall = !criterion
@@ -538,11 +608,46 @@ function buildPace(attempt) {
     };
 }
 
+// ─── เทียบกับคนอื่นแบบไม่เปิดเผยตัว (2026-09-18) ────────────────────────────────────────────────
+// "ได้ 68%" ไม่ได้บอกว่าพอสอบติดไหม โดยเฉพาะสนามที่แข่งกับคนอื่นอย่าง ก.พ. — ตัวเลขที่มีความหมายคือ
+// "สูงกว่าคนอื่นกี่ %" · **ไม่ใช่ leaderboard**: ไม่มีชื่อ ไม่มีอันดับ ไม่มีใครเห็นคะแนนของใคร
+// (CLAUDE.md ข้อ 5 ระบุว่าไม่ทำ leaderboard — อันนี้เป็นค่าสถิติล้วน ตัดสินใจร่วมกับผู้ใช้ 2026-09-18)
+//
+// นับ "คนละ 1 เสียง" โดยใช้คะแนนที่ดีที่สุดของแต่ละคน — ไม่งั้นคนที่ทำชุดเดิม 30 รอบจะถ่วงค่ากลางทั้งหมด
+// ซ่อนไปเลยถ้าคนทำยังน้อย (เทียบกับ 2 คนแล้วบอก "สูงกว่า 100%" ดูตลกและไม่มีความหมายทางสถิติ)
+const MIN_PEERS_FOR_COMPARISON = 5;
+
+async function buildPeerComparison(attempt) {
+    const isMock = !!attempt.att_mock_exam_id;
+    const score = Number(attempt.att_score);
+    if (!Number.isFinite(score)) return null;
+
+    const [[row]] = await pool.query(
+        `SELECT COUNT(*) AS peers, COALESCE(SUM(best_score < ?), 0) AS lower_count, COALESCE(AVG(best_score), 0) AS avg_score
+         FROM (
+            SELECT MAX(att_score) AS best_score
+            FROM tb_attempts
+            WHERE att_status = 'submitted' AND att_customer_id <> ? AND att_score IS NOT NULL
+              AND ${isMock ? "att_mock_exam_id = ?" : "att_product_id = ?"}
+            GROUP BY att_customer_id
+         ) peers`,
+        [score, attempt.att_customer_id, isMock ? attempt.att_mock_exam_id : attempt.att_product_id]
+    );
+    const peers = Number(row.peers);
+    if (peers < MIN_PEERS_FOR_COMPARISON) return null;
+    return {
+        peers,
+        // % ของคนอื่นที่คะแนนดีที่สุดของเขายังต่ำกว่าคะแนนครั้งนี้ของเรา
+        better_than_percent: Math.round((Number(row.lower_count) / peers) * 100),
+        average_score: Math.round(Number(row.avg_score)),
+    };
+}
+
 async function getReview(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
-        if (!(await requireStillEntitled(req.customer.cus_id, attempt.att_product_id, res))) return;
+        if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
         if (attempt.att_status !== "submitted") {
             return res.status(400).json({ message: "ยังไม่ได้ส่งคำตอบ ดูเฉลยไม่ได้" });
         }
@@ -555,7 +660,13 @@ async function getReview(req, res, next) {
         );
         const answerByQuestion = Object.fromEntries(answers.map((a) => [a.ans_question_id, a]));
 
-        const [[product]] = await pool.query("SELECT prod_name, prod_pass_percent, prod_pass_min FROM tb_products WHERE prod_id = ?", [attempt.att_product_id]);
+        // ใบปกติอ่านเกณฑ์จากชุดข้อสอบ · ใบสนามสอบอ่านจากสนามสอบ (โครงสร้าง+เกณฑ์เป็นของสนามสอบ ไม่ใช่ของชุดใดชุดหนึ่ง)
+        const [[product]] = attempt.att_mock_exam_id
+            ? [[]]
+            : await pool.query("SELECT prod_name, prod_pass_percent, prod_pass_min FROM tb_products WHERE prod_id = ?", [attempt.att_product_id]);
+        const [[mockExam]] = attempt.att_mock_exam_id
+            ? await pool.query("SELECT me_name, me_pass_percent, me_pass_min FROM tb_mock_exams WHERE me_id = ?", [attempt.att_mock_exam_id])
+            : [[]];
 
         // is_correct ต้องมาจาก ans_is_correct ที่บันทึกไว้ตอนตอบจริง (frozen ณ ตอนนั้น) ห้ามคำนวณสดจาก
         // choices.cho_is_correct ปัจจุบัน — เพราะแอดมินอาจแก้เฉลยทีหลัง (เช่น มีคนแจ้งปัญหาข้อนี้แล้วแก้ให้ถูก)
@@ -596,25 +707,31 @@ async function getReview(req, res, next) {
             [attempt.att_id]
         );
 
-        const [topicCriteria] = await pool.query(
-            "SELECT ptp_topic_id, ptp_pass_percent, ptp_pass_min FROM tb_product_topic_pass_criteria WHERE ptp_product_id = ?",
-            [attempt.att_product_id]
-        );
+        const [topicCriteria] = attempt.att_mock_exam_id
+            ? await pool.query(
+                "SELECT mes_topic_id AS ptp_topic_id, mes_pass_percent AS ptp_pass_percent, mes_pass_min AS ptp_pass_min FROM tb_mock_exam_sections WHERE mes_exam_id = ?",
+                [attempt.att_mock_exam_id]
+            )
+            : await pool.query(
+                "SELECT ptp_topic_id, ptp_pass_percent, ptp_pass_min FROM tb_product_topic_pass_criteria WHERE ptp_product_id = ?",
+                [attempt.att_product_id]
+            );
 
         // คะแนนครั้งก่อนของชุดเดียวกัน (ที่ส่งคำตอบแล้วและเกิดก่อนใบนี้) — ใช้บอกว่าดีขึ้นหรือแย่ลง
         // เทียบกับ "ครั้งก่อน" ไม่ใช่ "ดีที่สุด" เพราะสิ่งที่ผู้ใช้อยากรู้ทันทีคือรอบนี้พัฒนาขึ้นไหม
         const [[prev]] = await pool.query(
             `SELECT att_score FROM tb_attempts
-             WHERE att_customer_id = ? AND att_product_id = ? AND att_status = 'submitted'
-               AND att_submitted_at < ?
+             WHERE att_customer_id = ? AND att_status = 'submitted' AND att_submitted_at < ?
+               AND ${attempt.att_mock_exam_id ? "att_mock_exam_id = ?" : "att_product_id = ?"}
              ORDER BY att_submitted_at DESC LIMIT 1`,
-            [req.customer.cus_id, attempt.att_product_id, attempt.att_submitted_at]
+            [req.customer.cus_id, attempt.att_submitted_at, attempt.att_mock_exam_id ?? attempt.att_product_id]
         );
 
         res.json({
             att_id: attempt.att_id,
             att_product_id: attempt.att_product_id,
-            prod_name: product?.prod_name ?? "",
+            att_mock_exam_id: attempt.att_mock_exam_id ?? null,
+            prod_name: product?.prod_name ?? mockExam?.me_name ?? "",
             att_mode: attempt.att_mode,
             att_score: attempt.att_score,
             att_earned_score: attempt.att_earned_score,
@@ -625,13 +742,19 @@ async function getReview(req, res, next) {
             // null = ยังไม่เคยทำชุดนี้มาก่อน (ครั้งแรก จึงไม่มีอะไรให้เทียบ)
             prev_score: prev?.att_score ?? null,
             // จำนวนข้อของชุดนี้ที่ยังตอบผิดอยู่ (นับข้ามทุกครั้งที่ทำ ไม่ใช่เฉพาะใบนี้) — ใช้กับปุ่มไปหน้าทบทวน
+            // ใบสนามสอบดึงข้อจากหลายชุด ตัวเลข "ยังต้องทบทวน" จึงนับรวมทุกชุดที่ลูกค้ามี
             mistake_count: await countUnresolvedMistakes(req.customer.cus_id, attempt.att_product_id),
             // null = ชุดนี้ไม่ได้ตั้งเกณฑ์ผ่าน / ไม่ใช่โหมดจับเวลา — หน้าเว็บซ่อนส่วนนั้นไปเลย
             readiness: buildReadiness(
-                attempt, toCriterion(product?.prod_pass_percent, product?.prod_pass_min),
+                attempt, toCriterion(
+                    product?.prod_pass_percent ?? mockExam?.me_pass_percent,
+                    product?.prod_pass_min ?? mockExam?.me_pass_min
+                ),
                 answers.filter((a) => a.ans_is_correct).length, topicRows, topicCriteria
             ),
             pace: buildPace(attempt),
+            // null = คนทำชุดนี้ยังน้อยเกินกว่าจะเทียบได้อย่างมีความหมาย → หน้าเว็บซ่อนส่วนนี้ไปเลย
+            peer_comparison: await buildPeerComparison(attempt),
             topic_breakdown: topicRows.map((t) => ({
                 tpc_id: t.tpc_id,
                 tpc_name: t.tpc_name,
@@ -801,6 +924,156 @@ async function getProductSummary(req, res, next) {
 // เฉพาะชุดที่ยังมีสิทธิ์อยู่ (สิทธิ์หมด/ถูกยกเลิก = ทำใหม่ไม่ได้ เหมือนทำข้อสอบชุดนั้นไม่ได้)
 const PRACTICE_SIZE = 10;
 
+// ─── แผนทบทวนรายวัน (2026-09-18) ────────────────────────────────────────────────────────────────
+// "ตอบถูกวันนี้" ไม่เท่ากับ "จำได้ตอนสอบ" — ข้อที่แก้ได้แล้วจะถูกนัดกลับมาถามอีกโดยเว้นห่างขึ้นเรื่อยๆ
+// ตอบถูกอีก = เลื่อนชั้น (เว้นห่างขึ้น) · ตอบผิด = ลบนัดทิ้ง กลับไปเป็นข้อที่ต้องทบทวนทันที
+// ผ่านครบทุกชั้นแล้ว = ถือว่าจำได้จริง ไม่ถามอีก (ยกเว้นไปเจอในข้อสอบแล้วผิดใหม่)
+const REVIEW_INTERVALS_DAYS = [1, 3, 7, 14, 30];
+// จำนวนข้อต่อวันเมื่อ "ยังไม่ได้ตั้งวันสอบ" — พอให้ทำได้จริงทุกวันโดยไม่ท้อ
+const DEFAULT_DAILY_TARGET = 10;
+const MAX_DAILY_TARGET = 40;
+
+// วันที่ตามเวลาไทยเสมอ (เซิร์ฟเวอร์อาจเป็น UTC) — กติกาเดียวกับ bangkokDate() ของสถิติผู้เยี่ยมชม
+// คอลัมน์ DATE จาก mysql2 เป็น Date object ไม่ใช่สตริง — ต้องแปลงด้วยค่าตามเวลาท้องถิ่นของ Date นั้น
+// (ใช้ toISOString ไม่ได้ เพราะจะเลื่อนวันตาม timezone ของเครื่อง)
+function toDateString(value) {
+    if (!value) return null;
+    if (typeof value === "string") return value.slice(0, 10);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
+}
+
+function bangkokToday() {
+    const now = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    return now.toISOString().slice(0, 10);
+}
+// จุดเริ่มต้นของ "วันนี้ตามเวลาไทย" ในรูป Date จริง — เอาไปเทียบกับคอลัมน์ DATETIME ได้ตรงๆ
+function bangkokDayStart() {
+    return new Date(new Date(`${bangkokToday()}T00:00:00Z`).getTime() - 7 * 60 * 60 * 1000);
+}
+
+function daysUntil(examDate) {
+    if (!examDate) return null;
+    const target = new Date(`${String(examDate).slice(0, 10)}T00:00:00Z`).getTime();
+    const today = new Date(`${bangkokToday()}T00:00:00Z`).getTime();
+    return Math.round((target - today) / 86400000);
+}
+
+// ข้อที่ "ถึงคิวทบทวนวันนี้" = ข้อที่ยังตอบผิดอยู่ (ต้องทบทวนเสมอ) + ข้อที่เคยแก้ได้แล้วแต่ถึงกำหนดทวนซ้ำ
+// คืนรายการ ques_id + product เพื่อให้กรองสิทธิ์ต่อได้ · due_kind บอกว่ามาจากทางไหน (ใช้เรียงลำดับ)
+async function fetchDueQuestions(customerId, filters = {}) {
+    const conditions = ["q.ques_status = 'active'"];
+    const params = [customerId, customerId];
+    if (filters.product_id) { conditions.push("q.ques_product_id = ?"); params.push(filters.product_id); }
+    if (filters.topic_id) { conditions.push("q.ques_topic_id = ?"); params.push(filters.topic_id); }
+
+    const [rows] = await pool.query(
+        `SELECT m.ques_id, m.ques_product_id, m.wrong_count,
+                CASE WHEN m.latest_correct = 0 THEN 'unresolved'
+                     WHEN rs.rs_due_at IS NOT NULL AND rs.rs_due_at <= NOW() THEN 'scheduled'
+                     ELSE 'later' END AS due_kind,
+                rs.rs_due_at, rs.rs_stage
+         FROM (
+            SELECT q.ques_id, q.ques_product_id,
+                   ${WRONG_COUNT_SQL} AS wrong_count,
+                   ${LATEST_CORRECT_SQL} AS latest_correct
+            FROM ${mistakeEventsSql()}
+            JOIN tb_questions q ON q.ques_id = ev.question_id
+            WHERE ${conditions.join(" AND ")}
+            GROUP BY q.ques_id, q.ques_product_id
+            HAVING wrong_count > 0
+         ) m
+         LEFT JOIN tb_review_schedule rs ON rs.rs_question_id = m.ques_id AND rs.rs_customer_id = ?
+         ORDER BY m.wrong_count DESC, RAND()`,
+        [...params, customerId]
+    );
+    return rows;
+}
+
+// นัดครั้งถัดไปหลังตอบใหม่ — ถูก = เลื่อนชั้น, ผิด = ลบนัดทิ้ง (กลับไปต้องทบทวนทันที)
+async function updateReviewSchedule(customerId, questionId, isCorrect) {
+    if (!isCorrect) {
+        await pool.query("DELETE FROM tb_review_schedule WHERE rs_customer_id = ? AND rs_question_id = ?", [customerId, questionId]);
+        return;
+    }
+    const [[current]] = await pool.query(
+        "SELECT rs_stage FROM tb_review_schedule WHERE rs_customer_id = ? AND rs_question_id = ?", [customerId, questionId]
+    );
+    const stage = Math.min((current ? Number(current.rs_stage) : 0) + 1, REVIEW_INTERVALS_DAYS.length);
+    const days = REVIEW_INTERVALS_DAYS[stage - 1];
+    await pool.query(
+        `INSERT INTO tb_review_schedule (rs_customer_id, rs_question_id, rs_stage, rs_due_at)
+         VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL ? DAY))
+         ON DUPLICATE KEY UPDATE rs_stage = VALUES(rs_stage), rs_due_at = VALUES(rs_due_at)`,
+        [customerId, questionId, stage, days]
+    );
+}
+
+// GET /store/me/review-plan — "วันนี้ควรทบทวนกี่ข้อ" + นับถอยหลังวันสอบ
+// เป้าต่อวันคำนวณจากจำนวนข้อที่ต้องเคลียร์หารด้วยจำนวนวันที่เหลือ ถ้ายังไม่ตั้งวันสอบใช้ค่าเริ่มต้น
+async function getReviewPlan(req, res, next) {
+    try {
+        const customerId = req.customer.cus_id;
+        const [[customer]] = await pool.query("SELECT cus_exam_date FROM tb_customers WHERE cus_id = ?", [customerId]);
+        const examDate = toDateString(customer?.cus_exam_date);
+        const daysLeft = daysUntil(examDate);
+
+        const rows = await fetchDueQuestions(customerId);
+        const entitled = await entitledProductIds(customerId, rows.map((r) => r.ques_product_id));
+        const usable = rows.filter((r) => entitled.has(r.ques_product_id));
+        const unresolved = usable.filter((r) => r.due_kind === "unresolved").length;
+        const scheduled = usable.filter((r) => r.due_kind === "scheduled").length;
+        const later = usable.filter((r) => r.due_kind === "later").length;
+        const dueToday = unresolved + scheduled;
+
+        // ทบทวนไปแล้วกี่ข้อวันนี้ (นับข้อไม่ซ้ำ ตอบข้อเดิมซ้ำๆ ไม่ควรนับเป็นความคืบหน้า)
+        const [[{ done_today: doneToday }]] = await pool.query(
+            `SELECT COUNT(DISTINCT mr_question_id) AS done_today FROM tb_mistake_retries
+             WHERE mr_customer_id = ? AND mr_created_at >= ?`,
+            [customerId, bangkokDayStart()]
+        );
+
+        const target = daysLeft !== null && daysLeft > 0
+            ? Math.min(MAX_DAILY_TARGET, Math.max(1, Math.ceil(unresolved / daysLeft)))
+            : DEFAULT_DAILY_TARGET;
+
+        res.json({
+            exam_date: examDate,
+            days_left: daysLeft,
+            // ข้อที่ยังตอบผิดอยู่ (ต้องเคลียร์ให้ได้ก่อนสอบ) + ข้อที่ถึงกำหนดทวนซ้ำวันนี้
+            unresolved_count: unresolved,
+            scheduled_count: scheduled,
+            due_today: dueToday,
+            // ข้อที่แก้ได้แล้วและยังไม่ถึงกำหนดทวน — บอกให้เห็นว่า "เก็บไปแล้วเท่าไหร่"
+            resting_count: later,
+            done_today: Number(doneToday),
+            daily_target: Math.min(target, dueToday || target),
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
+// PUT /store/me/exam-date — body { exam_date: "YYYY-MM-DD" | null }
+async function setExamDate(req, res, next) {
+    try {
+        const raw = req.body?.exam_date;
+        if (raw !== null && raw !== undefined && raw !== "" && !/^\d{4}-\d{2}-\d{2}$/.test(String(raw))) {
+            return res.status(400).json({ message: "รูปแบบวันสอบไม่ถูกต้อง" });
+        }
+        const examDate = raw === null || raw === undefined || raw === "" ? null : String(raw);
+        // กันตั้งวันในอดีต (พิมพ์ปีผิดเป็นเรื่องปกติ) — วันนี้ยังตั้งได้ เผื่อสอบวันนี้
+        if (examDate && examDate < bangkokToday()) {
+            return res.status(400).json({ message: "วันสอบต้องไม่ใช่วันที่ผ่านมาแล้ว" });
+        }
+        await pool.query("UPDATE tb_customers SET cus_exam_date = ? WHERE cus_id = ?", [examDate, req.customer.cus_id]);
+        res.json({ exam_date: examDate, days_left: daysUntil(examDate) });
+    } catch (err) {
+        next(err);
+    }
+}
+
+
 async function entitledProductIds(customerId, productIds) {
     const unique = [...new Set(productIds)];
     const checks = await Promise.all(unique.map((pid) => hasActiveEntitlement(customerId, pid)));
@@ -817,23 +1090,32 @@ async function getMistakePractice(req, res, next) {
         if (req.query.product_id) { conditions.push("q.ques_product_id = ?"); params.push(req.query.product_id); }
         if (req.query.topic_id) { conditions.push("q.ques_topic_id = ?"); params.push(req.query.topic_id); }
 
-        const [rows] = await pool.query(
-            `SELECT m.ques_id, m.ques_product_id FROM (
-                SELECT q.ques_id, q.ques_product_id,
-                       ${WRONG_COUNT_SQL} AS wrong_count,
-                       ${LATEST_CORRECT_SQL} AS latest_correct
-                FROM ${mistakeEventsSql()}
-                JOIN tb_questions q ON q.ques_id = ev.question_id
-                WHERE ${conditions.join(" AND ")}
-                GROUP BY q.ques_id, q.ques_product_id
-                ${UNRESOLVED_MISTAKE_HAVING}
-             ) m
-             ORDER BY m.wrong_count DESC, RAND()`,
-            params
-        );
+        // โหมดแผนวันนี้ (?plan=1): ข้อที่ยังผิด + ข้อที่ถึงกำหนดทวนซ้ำ · โหมดปกติ: เฉพาะข้อที่ยังผิด
+        const planMode = req.query.plan === "1";
+        const rows = planMode
+            ? (await fetchDueQuestions(customerId, req.query)).filter((r) => r.due_kind !== "later")
+            : (await pool.query(
+                `SELECT m.ques_id, m.ques_product_id FROM (
+                    SELECT q.ques_id, q.ques_product_id,
+                           ${WRONG_COUNT_SQL} AS wrong_count,
+                           ${LATEST_CORRECT_SQL} AS latest_correct
+                    FROM ${mistakeEventsSql()}
+                    JOIN tb_questions q ON q.ques_id = ev.question_id
+                    WHERE ${conditions.join(" AND ")}
+                    GROUP BY q.ques_id, q.ques_product_id
+                    ${UNRESOLVED_MISTAKE_HAVING}
+                 ) m
+                 ORDER BY m.wrong_count DESC, RAND()`,
+                params
+            ))[0];
         const entitled = await entitledProductIds(customerId, rows.map((r) => r.ques_product_id));
         const available = rows.filter((r) => entitled.has(r.ques_product_id));
-        const picked = shuffle(available.slice(0, PRACTICE_SIZE));
+        // แผนวันนี้: ข้อที่ "ถึงกำหนดทวนซ้ำ" ได้คิวก่อน เพราะมีจำนวนจำกัดและเลยกำหนดแล้วคุณค่าลดลง
+        // ส่วนข้อที่ยังตอบผิดอยู่มีให้ทำได้ทุกวันอยู่แล้ว (ถ้าเรียงกลับกัน ข้อที่นัดไว้จะโดนเบียดตกรอบตลอดไป)
+        const ordered = planMode
+            ? [...available].sort((a, b) => (a.due_kind === b.due_kind ? 0 : a.due_kind === "scheduled" ? -1 : 1))
+            : available;
+        const picked = shuffle(ordered.slice(0, PRACTICE_SIZE));
 
         const questionMap = await fetchQuestionsByIds(picked.map((r) => r.ques_id));
         const [meta] = picked.length
@@ -896,6 +1178,7 @@ async function retryMistake(req, res, next) {
             "INSERT INTO tb_mistake_retries (mr_customer_id, mr_question_id, mr_selected_choice_id, mr_is_correct) VALUES (?, ?, ?, ?)",
             [customerId, questionId, choId, isCorrect ? 1 : 0]
         );
+        await updateReviewSchedule(customerId, questionId, isCorrect);
         const payload = buildQuestionPayload(question, question.choices.map((c) => c.cho_id), { ans_selected_choice_id: choId }, true);
         res.json({ is_correct: isCorrect, reveal: payload.reveal });
     } catch (err) {
@@ -1103,25 +1386,30 @@ async function getAttemptHistory(req, res, next) {
 
         const [rows] = await pool.query(
             `SELECT * FROM (
-                SELECT a.att_id, a.att_product_id, p.prod_name, a.att_mode, a.att_status,
+                SELECT a.att_id, a.att_product_id, a.att_mock_exam_id,
+                       COALESCE(p.prod_name, m.me_name) AS prod_name, a.att_mode, a.att_status,
                        a.att_score, a.att_earned_score, a.att_max_score, a.att_total_questions,
                        a.att_time_limit_minutes, a.att_started_at, a.att_submitted_at,
                        -- จำนวนข้อที่ตอบถูกจริง — นับจาก ans_is_correct ที่ freeze ไว้ตอนตอบ ไม่ถอดกลับจาก
                        -- att_score เพราะ % ถูกปัดทศนิยมเก็บไว้ การคูณกลับจะคลาดเคลื่อนได้เมื่อจำนวนข้อเยอะ
                        (SELECT COUNT(*) FROM tb_attempt_answers x
                          WHERE x.ans_attempt_id = a.att_id AND x.ans_is_correct = 1) AS att_correct_count,
-                       ROW_NUMBER() OVER (PARTITION BY a.att_product_id ORDER BY a.att_started_at ASC) AS attempt_no,
+                       -- ใบสนามสอบนับ "ครั้งที่" แยกของตัวเอง ไม่ปนกับครั้งที่ทำชุดข้อสอบ
+                       ROW_NUMBER() OVER (PARTITION BY COALESCE(a.att_product_id, a.att_mock_exam_id) ORDER BY a.att_started_at ASC) AS attempt_no,
                        -- คะแนนของครั้งก่อนหน้า "ที่ส่งคำตอบแล้ว" ของชุดเดียวกัน — ใช้ subquery แทน LAG()
                        -- เพราะ LAG จะหยิบแถวที่ติดกันมาตรงๆ ถ้าครั้งก่อนหน้าเป็น attempt ที่ยกเลิก/ทำค้าง
                        -- (att_score เป็น NULL) การเทียบ "ดีขึ้น/แย่ลง" จะหายไปทั้งที่มีคะแนนเก่าให้เทียบอยู่
                        -- MySQL ไม่รองรับ LAG(...) IGNORE NULLS จึงต้องเขียนแบบนี้
                        (SELECT b.att_score FROM tb_attempts b
                          WHERE b.att_customer_id = a.att_customer_id
-                           AND b.att_product_id = a.att_product_id
+                           AND COALESCE(b.att_product_id, b.att_mock_exam_id) = COALESCE(a.att_product_id, a.att_mock_exam_id)
                            AND b.att_status = 'submitted'
                            AND b.att_started_at < a.att_started_at
                          ORDER BY b.att_started_at DESC LIMIT 1) AS prev_score
-                FROM tb_attempts a JOIN tb_products p ON p.prod_id = a.att_product_id
+                -- LEFT JOIN ทั้งคู่: ใบปกติมีแต่ชุดข้อสอบ ใบสนามสอบมีแต่สนามสอบ
+                FROM tb_attempts a
+                LEFT JOIN tb_products p ON p.prod_id = a.att_product_id
+                LEFT JOIN tb_mock_exams m ON m.me_id = a.att_mock_exam_id
                 WHERE ${whereClause}
              ) t
              ORDER BY t.att_started_at DESC
@@ -1217,10 +1505,10 @@ async function exportPrintableQuestions(req, res, next) {
 }
 
 module.exports = {
-    startOrResumeAttempt, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory,
+    startOrResumeAttempt, startMockAttempt, getReviewPlan, setExamDate, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory,
     getProductSummary, getWeakAreas, getMistakes, getMistakePractice, retryMistake,
     fetchQuestionsWithChoices, fetchSampleQuestions, fetchQuestionsByIds, buildQuestionPayload, exportPrintableQuestions,
     SAMPLE_QUESTION_COUNT,
     // สำหรับทดสอบ
-    buildReadiness, buildPace, toCriterion,
+    buildReadiness, buildPace, toCriterion, buildPeerComparison, MIN_PEERS_FOR_COMPARISON,
 };

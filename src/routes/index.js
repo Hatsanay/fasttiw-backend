@@ -17,6 +17,7 @@ const reportController = require("../controllers/report.controller");
 const payrollController = require("../controllers/payroll.controller");
 const partnerController = require("../controllers/partner.controller");
 const packageController = require("../controllers/package.controller");
+const mockExamController = require("../controllers/mockExam.controller");
 const dataDeletionRequestController = require("../controllers/dataDeletionRequest.controller");
 const settingsController = require("../controllers/settings.controller");
 const partnerDistributionController = require("../controllers/partnerDistribution.controller");
@@ -100,6 +101,14 @@ router.put(
     productController.uploadCover
 );
 router.get("/V1/products/:id/preview", requireAuth, requirePermission("productsManagement"), productController.preview);
+
+// ─── mock exams (สนามสอบเสมือนจริง) ───────────────────────────────────────────
+// bit ใหม่ mockExamsManagement (ตำแหน่ง 71) — migration เติมให้ role ที่จัดการชุดข้อสอบได้อยู่แล้วโดยอัตโนมัติ
+router.get("/V1/mock-exams", requireAuth, requirePermission("mockExamsManagement"), mockExamController.getAll);
+router.get("/V1/mock-exams/:id", requireAuth, requirePermission("mockExamsManagement"), mockExamController.getOne);
+router.post("/V1/mock-exams", requireAuth, requirePermission("mockExamsManagement"), mockExamController.create);
+router.put("/V1/mock-exams/:id", requireAuth, requirePermission("mockExamsManagement"), mockExamController.update);
+router.delete("/V1/mock-exams/:id", requireAuth, requirePermission("mockExamsManagement"), mockExamController.remove);
 
 // ─── questions (คำถามในแต่ละ product) ──────────────────────────────────────────
 // ไม่ผูกกับ product เฉพาะเจาะจง เพราะรูปแบบคอลัมน์เหมือนกันทุกชุดข้อสอบ

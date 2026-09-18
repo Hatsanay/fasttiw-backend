@@ -9,6 +9,7 @@ const questionReportController = require("../controllers/questionReport.controll
 const newsController = require("../controllers/news.controller");
 const chatController = require("../controllers/chat.controller");
 const diagnosticController = require("../controllers/diagnostic.controller");
+const mockExamController = require("../controllers/mockExam.controller");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
 const { uploadImage } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
@@ -118,12 +119,19 @@ router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.get
 // ทำข้อสอบ
 router.post("/V1/store/products/:id/attempts", requireCustomerAuth, attemptController.startOrResumeAttempt);
 router.get("/V1/store/products/:id/export-questions", requireCustomerAuth, attemptController.exportPrintableQuestions);
+// สนามสอบเสมือนจริง — รายการที่ทำได้ + เริ่ม/ทำต่อ (ใบที่ได้ใช้ endpoint attempts ชุดเดิมทั้งหมดต่อจากนี้)
+router.get("/V1/store/mock-exams", requireCustomerAuth, mockExamController.listMockExams);
+router.post("/V1/store/mock-exams/:id/attempts", requireCustomerAuth, attemptController.startMockAttempt);
+
 router.get("/V1/store/attempts", requireCustomerAuth, attemptController.getAttemptHistory);
 // ต้องประกาศก่อน "/V1/store/attempts/:id" เสมอ ไม่งั้น "summary" จะถูกจับเป็น :id
 router.get("/V1/store/attempts/summary", requireCustomerAuth, attemptController.getProductSummary);
 router.get("/V1/store/me/weak-areas", requireCustomerAuth, attemptController.getWeakAreas);
 router.get("/V1/store/me/mistakes", requireCustomerAuth, attemptController.getMistakes);
 // ทำใหม่ข้อที่เคยผิด — ดู getMistakePractice/retryMistake (ต้องประกาศ /practice ก่อน route ที่มี :param เสมอ)
+// แผนทบทวนรายวัน (2026-09-18) — "วันนี้ควรทบทวนกี่ข้อ" + วันสอบที่ลูกค้าตั้งเอง
+router.get("/V1/store/me/review-plan", requireCustomerAuth, attemptController.getReviewPlan);
+router.put("/V1/store/me/exam-date", requireCustomerAuth, attemptController.setExamDate);
 router.get("/V1/store/me/mistakes/practice", requireCustomerAuth, attemptController.getMistakePractice);
 router.post("/V1/store/me/mistakes/:questionId/retry", requireCustomerAuth, attemptController.retryMistake);
 router.get("/V1/store/attempts/:id", requireCustomerAuth, attemptController.getAttempt);
