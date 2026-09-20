@@ -53,6 +53,8 @@ router.get("/V1/auth/verifyPermission", requireAuth, authController.verifyPermis
 router.get("/V1/audit-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getAuditLogs);
 // error ของ backend ย้อนหลัง — ใช้สิทธิ์เดียวกับ audit log (เป็นเรื่องการตรวจสอบระบบเหมือนกัน)
 router.get("/V1/error-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getErrorLogs);
+// ประวัติการเข้าสู่ระบบของลูกค้าทุกคน — สิทธิ์เดียวกับ audit log (ร่องรอยการใช้งานระบบเหมือนกัน)
+router.get("/V1/customer-login-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getCustomerLoginLogs);
 // อุปกรณ์ที่ล็อกอินอยู่ของตัวเอง — ไม่ต้องมีสิทธิ์พิเศษ ทุกคนจัดการของตัวเองได้
 router.get("/V1/users/me/sessions", requireAuth, auditLogController.getMySessions);
 router.delete("/V1/users/me/sessions/:id", requireAuth, auditLogController.revokeMySession);

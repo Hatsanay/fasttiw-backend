@@ -7,6 +7,9 @@ const { sendMail } = require("../utils/mailer");
 const { buildStaffResetOtpEmail, buildStaff2faEmail } = require("../utils/emailTemplates");
 const { signToken: signJwt, verifyToken } = require("../utils/jwt");
 const { createSession, revokeSessionByJti, revokeAllSessions } = require("../utils/userSession");
+// IP จริงของคนที่กดปุ่ม ไม่ใช่ IP ของเซิร์ฟเวอร์ Next — ทุกคำขอของแอดมินวิ่งผ่าน Next ก่อนเสมอ
+// (เชื่อ header x-client-ip ก็ต่อเมื่อ x-internal-secret ตรงเท่านั้น ดู rateLimit.middleware.js)
+const { clientKey } = require("../middlewares/rateLimit.middleware");
 
 const OTP_PURPOSE = "staff_reset";
 // ข้อความเดียวที่ตอบกลับเสมอไม่ว่าอีเมลนั้นจะมีบัญชีจริงหรือไม่ — กันคนใช้หน้านี้ไล่เช็คว่าอีเมลไหนเป็น
@@ -19,7 +22,7 @@ async function writeLoginLog({ user_id, email, fullname, action, req }) {
         `INSERT INTO tb_login_logs
             (log_id, log_user_id, log_email, log_fullname, log_action, log_ip_address, log_user_agent)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [log_id, user_id ?? null, email, fullname ?? null, action, req.ip, req.headers["user-agent"] ?? null]
+        [log_id, user_id ?? null, email, fullname ?? null, action, clientKey(req)?.slice(0, 45) ?? null, req.headers["user-agent"] ?? null]
     );
 }
 
@@ -58,7 +61,7 @@ async function login(req, res, next) {
         if (user.user_2fa_enabled) return sendLoginChallenge(req, res, user);
 
         // ผูก token กับ session ใน DB เพื่อให้เพิกถอนได้ทีหลัง (ดู utils/userSession.js)
-        const jti = await createSession(user.user_id, { deviceInfo: req.headers["user-agent"], ip: req.ip });
+        const jti = await createSession(user.user_id, { deviceInfo: req.headers["user-agent"], ip: clientKey(req) });
         const token = signToken({ user_id: user.user_id, user_role_id: user.user_role_id, jti });
         res.json({ token });
     } catch (err) {
@@ -82,7 +85,7 @@ async function sendLoginChallenge(req, res, user) {
     const email = req.body.user_email;
     try {
         const { code, expiresMinutes } = await issueOtp({ email, purpose: TWO_FA_PURPOSE });
-        const { subject, html } = buildStaff2faEmail({ code, expiresMinutes, fullname: fullnameOf(user), ip: req.ip });
+        const { subject, html } = buildStaff2faEmail({ code, expiresMinutes, fullname: fullnameOf(user), ip: clientKey(req) });
         await sendMail({ to: email, subject, html });
     } catch (err) {
         // ขอรหัสถี่เกินไป (429) — บอกตรงๆ ไม่งั้นผู้ใช้ค้างอยู่หน้ากรอกรหัสโดยไม่รู้ว่าทำไมเมลไม่มา
@@ -120,7 +123,7 @@ async function verifyLogin2fa(req, res, next) {
         await pool.query("UPDATE tb_users SET user_last_login_at = NOW() WHERE user_id = ?", [user.user_id]);
         await writeLoginLog({ user_id: user.user_id, email: user.user_email, fullname: fullnameOf(user), action: "login", req });
 
-        const jti = await createSession(user.user_id, { deviceInfo: req.headers["user-agent"], ip: req.ip });
+        const jti = await createSession(user.user_id, { deviceInfo: req.headers["user-agent"], ip: clientKey(req) });
         res.json({ token: signToken({ user_id: user.user_id, user_role_id: user.user_role_id, jti }) });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
@@ -150,7 +153,7 @@ async function setTwoFactor(req, res, next) {
             // ขั้นแรก: ส่งรหัสไปให้ก่อน แล้วให้เรียกซ้ำพร้อม otp
             try {
                 const { code, expiresMinutes } = await issueOtp({ email: user.user_email, purpose: TWO_FA_PURPOSE });
-                const { subject, html } = buildStaff2faEmail({ code, expiresMinutes, fullname: fullnameOf(user), ip: req.ip });
+                const { subject, html } = buildStaff2faEmail({ code, expiresMinutes, fullname: fullnameOf(user), ip: clientKey(req) });
                 await sendMail({ to: user.user_email, subject, html });
             } catch (err) {
                 if (err.status) return res.status(err.status).json({ message: err.message });

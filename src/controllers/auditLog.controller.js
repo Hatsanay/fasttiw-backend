@@ -115,4 +115,72 @@ async function getErrorLogs(req, res, next) {
     }
 }
 
-module.exports = { getAuditLogs, getErrorLogs, getMySessions, revokeMySession };
+// ── ประวัติการเข้าสู่ระบบของลูกค้า (รวมทุกคน) ──────────────────────────────────────
+// คู่กับหน้ารายลูกค้าที่ /customers (modal) — หน้านี้ตอบคำถามคนละข้อ: "ช่วงนี้มีอะไรผิดปกติบ้าง"
+// เช่น มีใครโดนไล่เดารหัสผ่านอยู่ไหม ไม่ใช่ "ลูกค้าคนนี้ใช้จากที่ไหนบ้าง"
+//
+// ใช้สิทธิ์ auditLogs เดียวกับ audit log/error log — เป็นร่องรอยการใช้งานระบบเหมือนกัน
+// และไม่ต้องเพิ่ม bit ใหม่ (ตำแหน่ง bit ผูกกับลำดับเมนูแบบหนึ่งต่อหนึ่ง เพิ่มทีต้องแก้ทั้งสองฝั่ง)
+async function getCustomerLoginLogs(req, res, next) {
+    try {
+        const limit = Math.min(Number(req.query.limit) || 20, 100);
+        const offset = Number(req.query.offset) || 0;
+
+        const conditions = [];
+        const params = [];
+        if (req.query.action) { conditions.push("clog_action = ?"); params.push(req.query.action); }
+        if (req.query.customer_id) { conditions.push("clog_customer_id = ?"); params.push(req.query.customer_id); }
+        if (req.query.date_from) { conditions.push("clog_created_at >= ?"); params.push(`${req.query.date_from} 00:00:00`); }
+        if (req.query.date_to) { conditions.push("clog_created_at <= ?"); params.push(`${req.query.date_to} 23:59:59`); }
+        if (req.query.search) {
+            // ค้นได้ทั้งจากตัวลูกค้าและจาก IP — ตอนสืบเรื่องน่าสงสัยมักเริ่มจาก IP ที่เห็นในแถวหนึ่ง
+            conditions.push("(clog_identifier LIKE ? OR clog_ip LIKE ? OR c.cus_username LIKE ? OR c.cus_email LIKE ? OR CONCAT(c.cus_fname, ' ', c.cus_lname) LIKE ?)");
+            const like = `%${req.query.search}%`;
+            params.push(like, like, like, like, like);
+        }
+        const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+        const [rows] = await pool.query(
+            `SELECT clog_id, clog_customer_id, clog_identifier, clog_action, clog_ip, clog_user_agent, clog_created_at,
+                    c.cus_username, c.cus_email,
+                    CASE WHEN c.cus_fname IS NOT NULL THEN CONCAT(c.cus_fname, ' ', c.cus_lname) ELSE NULL END AS cus_fullname
+             FROM tb_customer_login_logs
+             LEFT JOIN tb_customers c ON c.cus_id = clog_customer_id
+             ${whereClause}
+             ORDER BY clog_created_at DESC, clog_id DESC
+             LIMIT ? OFFSET ?`,
+            [...params, limit, offset]
+        );
+        const [[{ total }]] = await pool.query(
+            `SELECT COUNT(*) AS total FROM tb_customer_login_logs
+             LEFT JOIN tb_customers c ON c.cus_id = clog_customer_id ${whereClause}`,
+            params
+        );
+
+        // สรุปช่วง 24 ชม. ล่าสุดไว้บนหัวตาราง — ตัวเลขที่บอกว่า "ตอนนี้มีอะไรผิดปกติไหม" โดยไม่ต้องไล่อ่านทีละแถว
+        const [[summary]] = await pool.query(
+            `SELECT
+                COUNT(*) AS events_24h,
+                SUM(clog_action IN ('login','login_google')) AS logins_24h,
+                SUM(clog_action = 'login_failed') AS failed_24h,
+                COUNT(DISTINCT CASE WHEN clog_action = 'login_failed' THEN clog_ip END) AS failed_ips_24h
+             FROM tb_customer_login_logs
+             WHERE clog_created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)`
+        );
+
+        res.json({
+            data: rows,
+            total,
+            summary: {
+                events_24h: Number(summary.events_24h) || 0,
+                logins_24h: Number(summary.logins_24h) || 0,
+                failed_24h: Number(summary.failed_24h) || 0,
+                failed_ips_24h: Number(summary.failed_ips_24h) || 0,
+            },
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
+module.exports = { getAuditLogs, getErrorLogs, getMySessions, revokeMySession, getCustomerLoginLogs };
