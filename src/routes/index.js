@@ -30,6 +30,7 @@ const { rateLimit } = require("../middlewares/rateLimit.middleware");
 const { requirePermission } = require("../middlewares/permission.middleware");
 const visitController = require("../controllers/visit.controller");
 const auditLogController = require("../controllers/auditLog.controller");
+const diagnosticsController = require("../controllers/diagnostics.controller");
 const { uploadImage, uploadSpreadsheet } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
 
@@ -55,6 +56,8 @@ router.get("/V1/audit-logs", requireAuth, requirePermission("auditLogs"), auditL
 router.get("/V1/error-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getErrorLogs);
 // ประวัติการเข้าสู่ระบบของลูกค้าทุกคน — สิทธิ์เดียวกับ audit log (ร่องรอยการใช้งานระบบเหมือนกัน)
 router.get("/V1/customer-login-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getCustomerLoginLogs);
+// ตรวจว่า IP จริงของคนใช้งานเดินทางมาถึง backend ไหม — ต้องล็อกอินก่อน และไม่คืน secret ออกไป
+router.get("/V1/diagnostics/client-ip", requireAuth, diagnosticsController.getClientIpDiagnostics);
 // อุปกรณ์ที่ล็อกอินอยู่ของตัวเอง — ไม่ต้องมีสิทธิ์พิเศษ ทุกคนจัดการของตัวเองได้
 router.get("/V1/users/me/sessions", requireAuth, auditLogController.getMySessions);
 router.delete("/V1/users/me/sessions/:id", requireAuth, auditLogController.revokeMySession);
