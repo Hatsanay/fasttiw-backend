@@ -6,6 +6,7 @@ const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { generateTempPassword } = require("../utils/generatePassword");
 const { AVATAR_DIR, resolveUploadPath } = require("../utils/uploads");
+const { listCustomerLoginLogs, summarizeSharing } = require("../utils/customerLoginLog");
 
 async function getAll(req, res, next) {
     try {
@@ -189,4 +190,21 @@ async function uploadImage(req, res, next) {
     }
 }
 
-module.exports = { getAll, getOne, create, update, remove, resetPassword, uploadImage, saveAvatarForCustomer };
+// ประวัติการเข้าสู่ระบบของลูกค้าคนหนึ่ง + สัญญาณการแชร์บัญชี (2026-09-20)
+async function getLoginLogs(req, res, next) {
+    try {
+        const days = Math.min(Number(req.query.days) || 30, 365);
+        const limit = Math.min(Number(req.query.limit) || 100, 300);
+        // ดึงช่วง 30 วันเสมอสำหรับตัวสรุป ไม่ว่าแอดมินจะเลือกดูช่วงไหน — ไม่งั้นเลือก "7 วัน"
+        // แล้วตัวเลข 30 วันจะกลายเป็นค่าของ 7 วันเงียบๆ
+        const [rows, forSummary] = await Promise.all([
+            listCustomerLoginLogs(req.params.id, { days, limit }),
+            listCustomerLoginLogs(req.params.id, { days: 30, limit: 300 }),
+        ]);
+        res.json({ data: rows, summary: summarizeSharing(forSummary) });
+    } catch (err) {
+        next(err);
+    }
+}
+
+module.exports = { getAll, getOne, create, update, remove, resetPassword, uploadImage, saveAvatarForCustomer, getLoginLogs };

@@ -6,6 +6,8 @@ const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { generateTempPassword } = require("../utils/generatePassword");
 const { AVATAR_DIR, resolveUploadPath } = require("../utils/uploads");
+const { revokeAllSessions, createSession } = require("../utils/userSession");
+const { signToken } = require("../utils/jwt");
 
 async function me(req, res, next) {
     try {
@@ -14,7 +16,7 @@ async function me(req, res, next) {
             `SELECT u.user_id, u.user_fname, u.user_lname,
                     CONCAT(u.user_fname, ' ', u.user_lname) AS user_fullname,
                     u.user_email, u.user_phone, u.user_line_uid, u.user_whatsapp_no,
-                    u.user_avatar_url, u.user_must_change_password, r.role_name
+                    u.user_avatar_url, u.user_must_change_password, u.user_2fa_enabled, r.role_name
              FROM tb_users u
              LEFT JOIN tb_roles r ON r.role_id = u.user_role_id
              WHERE u.user_id = ?`,
@@ -164,6 +166,13 @@ async function update(req, res, next) {
             user_line_id, user_whatApp_no, user_role_id, user_status, user_base_salary,
         } = req.body;
 
+        // ตรวจฟิลด์บังคับเหมือนตอนสร้าง (2026-09-20) — เดิมไม่ได้ตรวจ ส่ง body ว่างมาจะไปพังที่ SQL แล้วตอบ
+        // 500 พร้อมข้อความของ MySQL ("Column 'user_fname' cannot be null") ซึ่งทั้งอ่านไม่รู้เรื่องสำหรับผู้ใช้
+        // และเป็นการเปิดเผยโครงสร้างตารางให้คนที่ยิง API มั่วโดยไม่จำเป็น
+        if (!user_fname || !user_lname || !user_email) {
+            return res.status(400).json({ message: "กรอกข้อมูลไม่ครบ" });
+        }
+
         const baseSalary = parseBaseSalary(user_base_salary);
         if (baseSalary.error) return res.status(400).json({ message: baseSalary.error });
 
@@ -221,7 +230,13 @@ async function changeOwnPassword(req, res, next) {
             [passwordHash, req.user.user_id]
         );
 
-        res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ" });
+        // เปลี่ยนรหัสผ่านแล้วต้องเตะอุปกรณ์อื่นที่ค้างอยู่ออกทั้งหมด (คนที่แอบใช้บัญชีอยู่ต้องหลุดทันที)
+        // แล้วออก token ใบใหม่ให้เครื่องที่กำลังใช้อยู่ ไม่งั้นคนที่เพิ่งตั้งรหัสเองจะโดนเด้งออกไปด้วย
+        await revokeAllSessions(req.user.user_id);
+        const jti = await createSession(req.user.user_id, { deviceInfo: req.headers["user-agent"], ip: req.ip });
+        const token = signToken({ user_id: req.user.user_id, user_role_id: req.user.user_role_id, jti });
+
+        res.json({ message: "เปลี่ยนรหัสผ่านสำเร็จ", token });
     } catch (err) {
         next(err);
     }
@@ -237,6 +252,10 @@ async function resetPassword(req, res, next) {
             [passwordHash, req.params.id]
         );
         if (result.affectedRows === 0) return res.status(404).json({ message: "ไม่พบผู้ใช้งาน" });
+
+        // แอดมินรีเซ็ตรหัสให้คนอื่นมักเป็นเพราะบัญชีนั้นมีปัญหา — ต้องเตะ session เดิมออกด้วย
+        // ไม่งั้นคนที่ถืออุปกรณ์นั้นอยู่ยังใช้งานต่อได้ทั้งที่รหัสผ่านถูกเปลี่ยนไปแล้ว
+        await revokeAllSessions(req.params.id);
 
         res.json({ temp_password });
     } catch (err) {

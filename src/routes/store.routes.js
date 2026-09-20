@@ -72,6 +72,7 @@ router.put("/V1/store/me/onboarding", requireCustomerAuth, customerAuthControlle
 router.put("/V1/store/me/image", requireCustomerAuth, uploadImage.single("image"), customerAuthController.uploadMyImage);
 router.get("/V1/store/me/sessions", requireCustomerAuth, customerAuthController.getMySessions);
 router.delete("/V1/store/me/sessions/:id", requireCustomerAuth, customerAuthController.deleteMySession);
+router.get("/V1/store/me/login-history", requireCustomerAuth, customerAuthController.getMyLoginHistory);
 router.post("/V1/store/me/deletion-request", requireCustomerAuth, dataDeletionRequestController.createMyRequest);
 
 // สาธารณะ ไม่ต้อง login — สำหรับหน้า landing/แคตตาล็อก

@@ -80,6 +80,8 @@ const PERMISSION_KEYS = [
     "visitorStats",
     // สนามสอบเสมือนจริง (2026-09-18) — ต่อท้ายเสมอ ห้ามแทรกกลาง (ตำแหน่ง bit ผูกกับ role_permission ใน DB)
     "mockExamsManagement",
+    // ประวัติการแก้ไขข้อมูล (audit log, 2026-09-20) — ต่อท้ายเสมอ
+    "auditLogs",
 ];
 
 const BIT_INDEX = Object.fromEntries(PERMISSION_KEYS.map((key, i) => [key, i]));

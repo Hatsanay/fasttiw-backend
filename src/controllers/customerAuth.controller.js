@@ -8,13 +8,12 @@ const { createSession, listSessions, revokeSession, revokeSessionByJti, revokeAl
 const { sendMail } = require("../utils/mailer");
 const { buildPasswordResetEmail, buildRegisterOtpEmail } = require("../utils/emailTemplates");
 const { exchangeCodeForProfile, signSignupToken, verifySignupToken } = require("../utils/googleAuth");
+const { recordCustomerLogin, listCustomerLoginLogs } = require("../utils/customerLoginLog");
+// กติกา OTP (อายุ/จำนวนครั้ง/ใช้ครั้งเดียว) ย้ายไปไว้ที่เดียวแล้ว ใช้ร่วมกับลืมรหัสผ่านฝั่งแอดมิน
+const { issueOtp, consumeOtp, markOtpUsed, OTP_TTL_MINUTES } = require("../utils/emailOtp");
 
 const RESET_TOKEN_TTL_MINUTES = 60;
 const RESET_MAX_REQUESTS_PER_HOUR = 3; // ต่อ 1 บัญชี — กันคนกดรัวจนเมลของลูกค้าเต็มและกันเปลืองโควตา SMTP
-
-const OTP_TTL_MINUTES = 10;
-const OTP_MAX_REQUESTS_PER_HOUR = 5; // ต่อ 1 อีเมล — เผื่อคนกดขอรหัสใหม่หลายรอบเพราะเมลเข้าช้า
-const OTP_MAX_ATTEMPTS = 5; // กรอกผิดได้กี่ครั้งต่อรหัส 1 ชุด ก่อนต้องขอรหัสใหม่
 
 /* ─────────────────── สมัครสมาชิก: ขอรหัส OTP → ยืนยันอีเมล → สร้างบัญชี ─────────────────── */
 
@@ -40,65 +39,17 @@ async function requestRegisterOtp(req, res, next) {
             return res.status(409).json({ message: "อีเมลนี้ถูกใช้งานแล้ว กรุณาเข้าสู่ระบบหรือใช้อีเมลอื่น" });
         }
 
-        const [recent] = await pool.query(
-            `SELECT COUNT(*) AS n FROM tb_email_otps
-             WHERE otp_email = ? AND otp_purpose = 'register' AND otp_created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)`,
-            [cus_email]
-        );
-        if (recent[0].n >= OTP_MAX_REQUESTS_PER_HOUR) {
-            return res.status(429).json({ message: "ขอรหัสยืนยันถี่เกินไป กรุณารอสักครู่แล้วลองใหม่" });
-        }
+        const { code, expiresMinutes } = await issueOtp({ email: cus_email, purpose: "register" });
 
-        // ขอรหัสใหม่ = รหัสเก่าที่ยังไม่ได้ใช้เป็นอันใช้ไม่ได้ทันที ให้มีรหัสที่ใช้ได้แค่ชุดล่าสุดชุดเดียว
-        await pool.query(
-            "UPDATE tb_email_otps SET otp_used_at = NOW() WHERE otp_email = ? AND otp_purpose = 'register' AND otp_used_at IS NULL",
-            [cus_email]
-        );
-
-        const code = generateOtp();
-        const otp_id = await generateId("tb_email_otps", "OTP");
-        await pool.query(
-            `INSERT INTO tb_email_otps (otp_id, otp_email, otp_purpose, otp_code_hash, otp_expires_at)
-             VALUES (?, ?, 'register', ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))`,
-            [otp_id, cus_email, hashToken(code), OTP_TTL_MINUTES]
-        );
-
-        const { subject, html } = buildRegisterOtpEmail({ code, expiresMinutes: OTP_TTL_MINUTES });
+        const { subject, html } = buildRegisterOtpEmail({ code, expiresMinutes });
         await sendMail({ to: cus_email, subject, html });
 
-        // เก็บกวาดรหัสเก่าที่หมดอายุนานแล้ว (ตารางนี้โตเร็วกว่า tb_password_resets แต่ยังไม่คุ้มตั้ง job แยก)
-        await pool.query("DELETE FROM tb_email_otps WHERE otp_expires_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
-
-        res.json({ message: `ส่งรหัสยืนยันไปที่ ${cus_email} แล้ว รหัสมีอายุ ${OTP_TTL_MINUTES} นาที` });
+        res.json({ message: `ส่งรหัสยืนยันไปที่ ${cus_email} แล้ว รหัสมีอายุ ${expiresMinutes} นาที` });
     } catch (err) {
+        // 429 จาก issueOtp (ขอรหัสถี่เกินไป) ส่งข้อความเดิมกลับไปให้ผู้ใช้เห็น
+        if (err.status) return res.status(err.status).json({ message: err.message });
         next(err);
     }
-}
-
-// ตรวจรหัส OTP ของอีเมลนั้น — คืน row ที่ใช้ได้ ถ้าไม่ผ่านจะโยน error พร้อมข้อความที่ส่งให้ผู้ใช้ได้เลย
-// นับ attempts ทุกครั้งที่กรอกผิด เพื่อไม่ให้ไล่เดา 6 หลักได้ไม่จำกัด (1 ล้านความเป็นไปได้ ถ้าไม่จำกัด
-// จำนวนครั้งก็ยิงจนถูกได้จริงในทางปฏิบัติ)
-async function consumeRegisterOtp(email, code) {
-    const fail = (message) => Object.assign(new Error(message), { status: 400 });
-
-    const [rows] = await pool.query(
-        `SELECT otp_id, otp_code_hash, otp_attempts FROM tb_email_otps
-         WHERE otp_email = ? AND otp_purpose = 'register' AND otp_used_at IS NULL AND otp_expires_at > NOW()
-         ORDER BY otp_created_at DESC LIMIT 1`,
-        [email]
-    );
-    const otp = rows[0];
-    if (!otp) throw fail("รหัสยืนยันหมดอายุหรือยังไม่ได้ขอรหัส กรุณากดขอรหัสใหม่");
-
-    if (otp.otp_attempts >= OTP_MAX_ATTEMPTS) {
-        throw fail("กรอกรหัสผิดหลายครั้งเกินไป กรุณากดขอรหัสใหม่");
-    }
-    if (otp.otp_code_hash !== hashToken(String(code ?? ""))) {
-        await pool.query("UPDATE tb_email_otps SET otp_attempts = otp_attempts + 1 WHERE otp_id = ?", [otp.otp_id]);
-        const left = OTP_MAX_ATTEMPTS - otp.otp_attempts - 1;
-        throw fail(left > 0 ? `รหัสยืนยันไม่ถูกต้อง (เหลือ ${left} ครั้ง)` : "กรอกรหัสผิดหลายครั้งเกินไป กรุณากดขอรหัสใหม่");
-    }
-    return otp.otp_id;
 }
 
 // สมัครสมาชิกเอง (ต่างจาก customer.controller.js create() ที่แอดมินกดสร้างให้ทางแชท) —
@@ -124,7 +75,7 @@ async function register(req, res, next) {
         }
 
         const email = String(cus_email).trim();
-        const otpId = await consumeRegisterOtp(email, otp);
+        const otpId = await consumeOtp({ email, purpose: "register", code: otp });
 
         const cus_id = await generateId("tb_customers", "CUS");
         const passwordHash = await bcrypt.hash(cus_password, 10);
@@ -139,11 +90,12 @@ async function register(req, res, next) {
 
         // ตัดรหัสทิ้งหลังสร้างบัญชีสำเร็จเท่านั้น — ถ้าสร้างไม่ผ่าน (เช่นชื่อผู้ใช้ซ้ำ) รหัสเดิมยังใช้ได้อยู่
         // ผู้ใช้จะได้แค่แก้ชื่อผู้ใช้แล้วกดสมัครใหม่ ไม่ต้องไปขอรหัสใหม่ทางอีเมลอีกรอบ
-        await pool.query("UPDATE tb_email_otps SET otp_used_at = NOW() WHERE otp_id = ?", [otpId]);
+        await markOtpUsed(otpId);
 
         // สมัครเองไม่ต้องผ่านขั้นตอนเปลี่ยนรหัส/เติมข้อมูลบังคับ (mcp = false ตั้งแต่แรก)
         const jti = await createSession(cus_id, req.headers["user-agent"]);
         const token = signToken({ cus_id, mcp: false, jti });
+        recordCustomerLogin(req, { customerId: cus_id, identifier: cus_username, action: "register" });
         res.status(201).json({ token });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
@@ -168,14 +120,18 @@ async function login(req, res, next) {
         );
         const customer = rows[0];
         if (!customer || customer.cus_status !== "active") {
+            // บันทึกด้วยแม้บัญชีไม่มีอยู่จริง — การไล่เดาชื่อผู้ใช้คือสิ่งที่อยากเห็นย้อนหลัง
+            recordCustomerLogin(req, { customerId: customer?.cus_id ?? null, identifier: cus_username, action: "login_failed" });
             return res.status(401).json({ message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
         }
 
         const passwordOk = await bcrypt.compare(cus_password, customer.cus_password);
         if (!passwordOk) {
+            recordCustomerLogin(req, { customerId: customer.cus_id, identifier: cus_username, action: "login_failed" });
             return res.status(401).json({ message: "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" });
         }
 
+        recordCustomerLogin(req, { customerId: customer.cus_id, identifier: cus_username, action: "login" });
         res.json({ token: await issueLoginToken(customer, req.headers["user-agent"]) });
     } catch (err) {
         next(err);
@@ -221,7 +177,7 @@ async function findCustomerForGoogle(profile) {
 
 // ล็อกอินบัญชีที่หาเจอ (และผูก Google ให้ถ้ายังไม่เคยผูก) — ใช้ทั้งตอนล็อกอินปกติและตอนกดสร้างบัญชีแล้ว
 // พบว่ามีบัญชีเกิดขึ้นระหว่างทาง
-async function loginWithGoogle(customer, profile, userAgent) {
+async function loginWithGoogle(req, customer, profile) {
     // ต่างจากล็อกอินด้วยรหัสผ่านที่ตอบกลางๆ "ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง" — ที่นี่ผู้ใช้พิสูจน์ตัวตนกับ Google
     // แล้ว บอกตรงๆ ว่าบัญชีถูกระงับได้โดยไม่เปิดเผยอะไรเพิ่ม และช่วยให้เขาไปติดต่อแอดมินได้ถูกทาง
     if (customer.cus_status !== "active") {
@@ -231,7 +187,8 @@ async function loginWithGoogle(customer, profile, userAgent) {
         // WHERE ... IS NULL กันสอง request เชื่อมพร้อมกันเขียนทับกัน
         await pool.query("UPDATE tb_customers SET cus_google_sub = ? WHERE cus_id = ? AND cus_google_sub IS NULL", [profile.sub, customer.cus_id]);
     }
-    return issueLoginToken(customer, userAgent);
+    recordCustomerLogin(req, { customerId: customer.cus_id, identifier: profile.email, action: "login_google" });
+    return issueLoginToken(customer, req.headers["user-agent"]);
 }
 
 // ชื่อผู้ใช้อัตโนมัติจากส่วนหน้าของอีเมล — ลูกค้าที่สมัครผ่าน Google ไม่ต้องตั้งเอง (ไม่ได้ใช้ล็อกอินอยู่แล้ว)
@@ -280,7 +237,7 @@ async function googleLogin(req, res, next) {
         if (!customer) {
             return res.json({ needs_signup: true, signup_token: signSignupToken(profile) });
         }
-        res.json({ token: await loginWithGoogle(customer, profile, req.headers["user-agent"]) });
+        res.json({ token: await loginWithGoogle(req, customer, profile) });
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
         next(err);
@@ -301,17 +258,18 @@ async function googleSignupComplete(req, res, next) {
         // หาใหม่อีกรอบก่อนสร้าง — ระหว่างที่ผู้ใช้อ่านหน้ายอมรับ PDPA อาจมีบัญชีเกิดขึ้นแล้ว (กดสองแท็บพร้อมกัน /
         // สมัครด้วยรหัสผ่านอีกแท็บ) ถ้ามีแล้วล็อกอินเข้าบัญชีนั้นแทน ไม่สร้างซ้ำ
         const existing = await findCustomerForGoogle(profile);
-        if (existing) return res.json({ token: await loginWithGoogle(existing, profile, userAgent) });
+        if (existing) return res.json({ token: await loginWithGoogle(req, existing, profile) });
 
         try {
             const created = await createGoogleCustomer(profile);
+            recordCustomerLogin(req, { customerId: created.cus_id, identifier: profile.email, action: "register" });
             res.status(201).json({ token: await issueLoginToken(created, userAgent) });
         } catch (err) {
             // ชนที่อีเมล/sub = อีกแท็บเพิ่งสร้างสำเร็จไปก่อนหน้าเสี้ยววินาที — ล็อกอินเข้าบัญชีนั้นแทน
             if (err.code !== "ER_DUP_ENTRY") throw err;
             const raced = await findCustomerForGoogle(profile);
             if (!raced) throw err;
-            res.json({ token: await loginWithGoogle(raced, profile, userAgent) });
+            res.json({ token: await loginWithGoogle(req, raced, profile) });
         }
     } catch (err) {
         if (err.status) return res.status(err.status).json({ message: err.message });
@@ -420,6 +378,7 @@ async function resetPassword(req, res, next) {
         // จงใจไม่แตะ cus_must_change_password — บัญชีที่แอดมินสร้างให้ยังต้องผ่านหน้า onboarding
         // (กรอกชื่อ-นามสกุล + ยอมรับ PDPA) อยู่ดี การตั้งรหัสผ่านผ่านลิงก์ไม่ได้เก็บข้อมูลพวกนั้น
         await revokeAllSessions(request.pr_customer_id);
+        recordCustomerLogin(req, { customerId: request.pr_customer_id, action: "password_reset" });
 
         res.json({ message: "ตั้งรหัสผ่านใหม่เรียบร้อยแล้ว กรุณาเข้าสู่ระบบด้วยรหัสผ่านใหม่" });
     } catch (err) {
@@ -555,6 +514,22 @@ async function changeMyPassword(req, res, next) {
 }
 
 // รายการอุปกรณ์ที่ล็อกอินอยู่ตอนนี้ (สูงสุด 2 ตามโควตา) — ให้ผู้ใช้เตะอุปกรณ์อื่นออกเองได้จากหน้าบัญชี
+// ประวัติการเข้าสู่ระบบของตัวเอง — ถ้ามีคนอื่นเข้าบัญชีได้ เจ้าตัวคือคนที่มีโอกาสเห็นก่อนใคร
+// (แอดมินไม่ได้นั่งไล่ดูทุกบัญชี) รวมครั้งที่ล็อกอินไม่สำเร็จด้วย เพราะ "มีคนพยายามเข้า" คือสัญญาณเตือนตัวจริง
+async function getMyLoginHistory(req, res, next) {
+    try {
+        const rows = await listCustomerLoginLogs(req.customer.cus_id, { days: 90, limit: 50 });
+        res.json({
+            data: rows.map((r) => ({
+                id: r.clog_id, action: r.clog_action, ip: r.clog_ip,
+                user_agent: r.clog_user_agent, created_at: r.clog_created_at,
+            })),
+        });
+    } catch (err) {
+        next(err);
+    }
+}
+
 async function getMySessions(req, res, next) {
     try {
         const sessions = await listSessions(req.customer.cus_id);
@@ -569,6 +544,7 @@ async function getMySessions(req, res, next) {
 async function deleteMySession(req, res, next) {
     try {
         await revokeSession(req.customer.cus_id, req.params.id);
+        recordCustomerLogin(req, { customerId: req.customer.cus_id, action: "device_revoked" });
         res.json({ message: "ออกจากระบบอุปกรณ์นั้นแล้ว" });
     } catch (err) {
         next(err);
@@ -579,6 +555,7 @@ async function deleteMySession(req, res, next) {
 // ตัวเองเฉยๆ ไม่เคยบอก backend เลย ทำให้ session แถวนี้ยัง "active" ค้างอยู่ต่อไปจนกว่าจะโดน FIFO evict
 // เอง (ตอนล็อกอินอุปกรณ์ที่ 3) ขัดกับจุดประสงค์ของฟีเจอร์จำกัด 2 อุปกรณ์ที่ควรว่างทันทีที่ logout จริง
 async function logout(req, res, next) {
+    recordCustomerLogin(req, { customerId: req.customer?.cus_id ?? null, action: "logout" });
     try {
         await revokeSessionByJti(req.customer.cus_id, req.customer.jti);
         res.json({ message: "ออกจากระบบสำเร็จ" });
@@ -589,6 +566,6 @@ async function logout(req, res, next) {
 
 module.exports = {
     register, login, getMe, completeOnboarding, updateMyProfile, changeMyPassword, uploadMyImage,
-    getMySessions, deleteMySession, logout, forgotPassword, resetPassword, requestRegisterOtp,
+    getMySessions, getMyLoginHistory, deleteMySession, logout, forgotPassword, resetPassword, requestRegisterOtp,
     googleLogin, googleSignupComplete, updateMyName,
 };

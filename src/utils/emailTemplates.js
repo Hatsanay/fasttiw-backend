@@ -241,4 +241,69 @@ function buildRegisterOtpEmail({ code, expiresMinutes }) {
     };
 }
 
-module.exports = { buildReceiptEmail, buildPasswordResetEmail, buildRegisterOtpEmail, renderLayout, thaiDateTime, thaiDate, baht };
+// รหัสตั้งรหัสผ่านใหม่ของ "ผู้ใช้งานระบบหลังบ้าน" (2026-09-20) — คนละฉบับกับของลูกค้าโดยตั้งใจ
+// ฝั่งลูกค้าส่ง**ลิงก์** (token ยาว เดาไม่ได้) ส่วนฝั่งแอดมินส่ง**รหัส 6 หลัก** ตามที่ผู้ใช้สั่ง — ข้อความจึง
+// ต้องเตือนให้ชัดกว่าเดิมว่าห้ามบอกรหัสนี้กับใคร เพราะบัญชีหลังบ้านเข้าถึงข้อมูลลูกค้าทั้งระบบ
+function buildStaffResetOtpEmail({ code, expiresMinutes, fullname }) {
+    const bodyHtml = `
+      <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#8b95a5;margin-bottom:6px;">ระบบหลังบ้าน</div>
+      <h1 style="margin:0 0 6px;font-size:23px;font-weight:600;color:${INK};">รหัสสำหรับตั้งรหัสผ่านใหม่</h1>
+      <p style="margin:0 0 4px;color:${INK_SOFT};">
+        ${fullname ? `สวัสดีคุณ${escapeHtml(fullname)} ` : ""}นำรหัสด้านล่างไปกรอกในหน้า "ลืมรหัสผ่าน" ที่เปิดค้างไว้ แล้วตั้งรหัสผ่านใหม่ได้ทันที
+      </p>
+
+      <div style="margin:24px 0 8px;padding:20px;background:#f7f9ff;border:1px solid #dbe4fb;border-radius:12px;text-align:center;">
+        <div style="font-size:34px;font-weight:600;letter-spacing:.32em;color:${BRAND_BLUE};font-family:'Courier New',monospace;">${escapeHtml(code)}</div>
+      </div>
+
+      <p style="margin:14px 0 0;color:${INK_SOFT};font-size:13.5px;">
+        รหัสนี้ใช้ได้ครั้งเดียวและหมดอายุใน ${expiresMinutes} นาที ถ้าหมดอายุแล้วกดขอรหัสใหม่ได้จากหน้าเดิม
+      </p>
+      <p style="margin:14px 0 0;padding:14px 16px;background:#fff8ec;border:1px solid #ffe2b8;border-radius:10px;color:${INK_SOFT};font-size:13.5px;">
+        <strong style="color:${INK};">ไม่ได้เป็นคนขอ?</strong> ไม่ต้องทำอะไรเลย รหัสผ่านเดิมยังใช้ได้ตามปกติจนกว่าจะมีการกรอกรหัสนี้
+        — <strong style="color:${INK};">อย่าบอกรหัสนี้กับใครเด็ดขาด</strong> ไม่ว่าจะอ้างว่าเป็นทีมงานหรือผู้ดูแลระบบก็ตาม
+      </p>`;
+
+    return {
+        subject: `${code} คือรหัสตั้งรหัสผ่านใหม่ (ระบบหลังบ้าน Fasttiw)`,
+        html: renderLayout({
+            title: "รหัสตั้งรหัสผ่านใหม่",
+            preheader: `รหัส ${code} ใช้ได้ ${expiresMinutes} นาที`,
+            bodyHtml,
+        }),
+    };
+}
+
+// รหัสยืนยันตอนเข้าสู่ระบบ (2FA ของระบบหลังบ้าน, 2026-09-20) — ต่างจากรหัสตั้งรหัสผ่านใหม่ตรงที่
+// ถ้าผู้ใช้ไม่ได้เป็นคนล็อกอินเอง แปลว่า**มีคนรู้รหัสผ่านของบัญชีนี้แล้ว** ต้องบอกให้รีบเปลี่ยนรหัสทันที
+function buildStaff2faEmail({ code, expiresMinutes, fullname, ip }) {
+    const bodyHtml = `
+      <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#8b95a5;margin-bottom:6px;">ระบบหลังบ้าน</div>
+      <h1 style="margin:0 0 6px;font-size:23px;font-weight:600;color:${INK};">รหัสยืนยันการเข้าสู่ระบบ</h1>
+      <p style="margin:0 0 4px;color:${INK_SOFT};">
+        ${fullname ? `สวัสดีคุณ${escapeHtml(fullname)} ` : ""}มีการเข้าสู่ระบบด้วยรหัสผ่านของบัญชีนี้ นำรหัสด้านล่างไปกรอกเพื่อยืนยันว่าเป็นคุณจริง
+      </p>
+
+      <div style="margin:24px 0 8px;padding:20px;background:#f7f9ff;border:1px solid #dbe4fb;border-radius:12px;text-align:center;">
+        <div style="font-size:34px;font-weight:600;letter-spacing:.32em;color:${BRAND_BLUE};font-family:'Courier New',monospace;">${escapeHtml(code)}</div>
+      </div>
+
+      <p style="margin:14px 0 0;color:${INK_SOFT};font-size:13.5px;">
+        รหัสนี้ใช้ได้ครั้งเดียวและหมดอายุใน ${expiresMinutes} นาที${ip ? ` · คำขอมาจาก IP ${escapeHtml(ip)}` : ""}
+      </p>
+      <p style="margin:14px 0 0;padding:14px 16px;background:#fff1f1;border:1px solid #ffd4d4;border-radius:10px;color:${INK_SOFT};font-size:13.5px;">
+        <strong style="color:${INK};">ไม่ได้เป็นคนเข้าสู่ระบบ?</strong> แปลว่ามีคนรู้รหัสผ่านของบัญชีนี้แล้ว
+        <strong style="color:${INK};">ให้รีบเปลี่ยนรหัสผ่านทันที</strong> และอย่าบอกรหัสนี้กับใครเด็ดขาด
+      </p>`;
+
+    return {
+        subject: `${code} คือรหัสยืนยันการเข้าสู่ระบบ (ระบบหลังบ้าน Fasttiw)`,
+        html: renderLayout({
+            title: "รหัสยืนยันการเข้าสู่ระบบ",
+            preheader: `รหัส ${code} ใช้ได้ ${expiresMinutes} นาที`,
+            bodyHtml,
+        }),
+    };
+}
+
+module.exports = { buildReceiptEmail, buildPasswordResetEmail, buildRegisterOtpEmail, buildStaffResetOtpEmail, buildStaff2faEmail, renderLayout, thaiDateTime, thaiDate, baht };

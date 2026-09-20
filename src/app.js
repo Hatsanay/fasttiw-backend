@@ -5,6 +5,7 @@ const path = require("path");
 const routes = require("./routes");
 const storeRoutes = require("./routes/store.routes");
 const { notFound, errorHandler } = require("./middlewares/error.middleware");
+const { auditLog } = require("./middlewares/auditLog.middleware");
 
 const app = express();
 
@@ -23,6 +24,8 @@ app.use(express.urlencoded({ extended: true }));
 // เสิร์ฟรูปโปรไฟล์ที่อัปโหลดไว้ static ที่ /uploads/<filename> ตรงกับ user_avatar_url ที่เก็บใน DB
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
+// บันทึกทุกคำขอที่เปลี่ยนข้อมูลของฝั่งแอดมิน — ตัว middleware ข้าม GET/ของลูกค้า/auth ให้เอง
+app.use("/api", auditLog);
 app.use("/api", routes);
 app.use("/api", storeRoutes);
 

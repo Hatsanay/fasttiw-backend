@@ -15,9 +15,11 @@ const PRUNE_THRESHOLD = 5000; // จำนวน key ที่ยอมให้
 
 function clientKey(req) {
     const secret = process.env.INTERNAL_PROXY_SECRET;
-    const forwarded = req.headers["x-client-ip"];
+    // ?. เพราะ clientKey ถูกเรียกจาก error handler ด้วย ซึ่งอาจได้ req ที่ไม่สมบูรณ์ (เช่นคำขอที่พังตั้งแต่
+    // ก่อน express ประกอบ req เสร็จ) — ตัวบันทึก error ห้ามพังซ้อน error เดิมเด็ดขาด
+    const forwarded = req.headers?.["x-client-ip"];
     // เชื่อ IP ที่ส่งมาต่อเมื่อ secret ตรงเท่านั้น — ถ้าไม่ได้ตั้ง secret ไว้ ถือว่าไม่เชื่อ header ใดๆ
-    if (secret && forwarded && req.headers["x-internal-secret"] === secret) {
+    if (secret && forwarded && req.headers?.["x-internal-secret"] === secret) {
         return String(forwarded).split(",")[0].trim();
     }
     return req.ip || req.socket?.remoteAddress || "unknown";

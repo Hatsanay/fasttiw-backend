@@ -26,8 +26,10 @@ const orderController = require("../controllers/order.controller");
 const newsController = require("../controllers/news.controller");
 const chatController = require("../controllers/chat.controller");
 const { requireAuth } = require("../middlewares/auth.middleware");
+const { rateLimit } = require("../middlewares/rateLimit.middleware");
 const { requirePermission } = require("../middlewares/permission.middleware");
 const visitController = require("../controllers/visit.controller");
+const auditLogController = require("../controllers/auditLog.controller");
 const { uploadImage, uploadSpreadsheet } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
 
@@ -36,9 +38,42 @@ const router = express.Router();
 router.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // ─── auth ───────────────────────────────────────────────────────────────────
-router.post("/V1/auth/login", authController.login);
+// ลิมิตต่อ IP — บัญชีหลังบ้านเข้าถึงข้อมูลลูกค้าทั้งระบบ แต่เดิมหน้านี้ยิงเดารหัสผ่านได้ไม่จำกัด
+// (ฝั่งลูกค้ามีลิมิตนี้มาตั้งแต่ 2026-09-04 แล้ว ฝั่งแอดมินเพิ่งมี 2026-09-20)
+// ตั้งหลวมกว่าฝั่งลูกค้าเล็กน้อย เพราะแอดมินทั้งออฟฟิศอาจออกเน็ตทาง IP เดียวกัน
+const adminLoginLimiter = rateLimit({
+    name: "staff-login", windowMs: 15 * 60 * 1000, max: 30,
+    message: "พยายามเข้าสู่ระบบถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+router.post("/V1/auth/login", adminLoginLimiter, authController.login);
 router.post("/V1/auth/logout", requireAuth, authController.logout);
 router.get("/V1/auth/verifyPermission", requireAuth, authController.verifyPermission);
+
+// ประวัติการแก้ไขข้อมูล (audit log) — อ่านอย่างเดียว ไม่มี endpoint แก้/ลบโดยตั้งใจ
+router.get("/V1/audit-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getAuditLogs);
+// error ของ backend ย้อนหลัง — ใช้สิทธิ์เดียวกับ audit log (เป็นเรื่องการตรวจสอบระบบเหมือนกัน)
+router.get("/V1/error-logs", requireAuth, requirePermission("auditLogs"), auditLogController.getErrorLogs);
+// อุปกรณ์ที่ล็อกอินอยู่ของตัวเอง — ไม่ต้องมีสิทธิ์พิเศษ ทุกคนจัดการของตัวเองได้
+router.get("/V1/users/me/sessions", requireAuth, auditLogController.getMySessions);
+router.delete("/V1/users/me/sessions/:id", requireAuth, auditLogController.revokeMySession);
+
+// ลืมรหัสผ่านของผู้ใช้งานระบบหลังบ้าน (2026-09-20) — สาธารณะ (คนที่ลืมรหัสยังล็อกอินไม่ได้)
+// จึงต้องมีลิมิตต่อ IP เหมือน endpoint สาธารณะฝั่งลูกค้า: ขอรหัสรัวๆ = สแปมกล่องเมลคนอื่น + เปลืองโควตา SMTP
+// ส่วนการไล่เดารหัส 6 หลักถูกกันด้วยจำนวนครั้งต่อรหัสอยู่แล้ว (utils/emailOtp.js) ลิมิตนี้กันการยิงข้ามบัญชี
+const forgotPasswordLimiter = rateLimit({
+    name: "staff-forgot-password", windowMs: 60 * 60 * 1000, max: 10,
+    message: "ขอรหัสยืนยันถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+const resetPasswordLimiter = rateLimit({
+    name: "staff-reset-password", windowMs: 60 * 60 * 1000, max: 30,
+    message: "ลองตั้งรหัสผ่านใหม่ถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+// ยืนยันตัวตนสองชั้น — ขั้นที่สองของการ login (ลิมิตเดียวกับหน้า login เพราะเป็นด่านเดาเลข 6 หลัก)
+router.post("/V1/auth/login/2fa", adminLoginLimiter, authController.verifyLogin2fa);
+router.put("/V1/auth/2fa", requireAuth, authController.setTwoFactor);
+
+router.post("/V1/auth/forgot-password", forgotPasswordLimiter, authController.forgotPassword);
+router.post("/V1/auth/reset-password", resetPasswordLimiter, authController.resetPassword);
 
 // ─── users ──────────────────────────────────────────────────────────────────
 // route ที่ขึ้นต้นด้วย /me ต้องประกาศก่อน /:id เสมอ ไม่งั้น express จะจับ "me" เป็นค่า :id ไปก่อน
@@ -252,6 +287,13 @@ router.put(
     customerController.uploadImage
 );
 router.delete("/V1/customers/:id", requireAuth, requirePermission("deleteCustomer"), customerController.remove);
+// ประวัติการเข้าสู่ระบบรายลูกค้า — ใช้สิทธิ์เดียวกับหน้าลูกค้า (แอดมินที่ดูลูกค้าได้ ควรเห็นว่าบัญชีถูกใช้จากที่ไหนบ้าง)
+router.get(
+    "/V1/customers/:id/login-logs",
+    requireAuth,
+    requirePermission("customersManagement"),
+    customerController.getLoginLogs
+);
 
 // ─── entitlements (สิทธิ์การเข้าถึงชุดข้อสอบของลูกค้า) ───────────────────────────
 router.get(
