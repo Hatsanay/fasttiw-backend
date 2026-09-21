@@ -3,6 +3,7 @@ const app = require("./app");
 const pool = require("./config/db");
 const { startEntitlementExpirySweep } = require("./jobs/entitlementExpirySweep");
 const { startOrderExpirySweep } = require("./jobs/orderExpirySweep");
+const { startExamOutcomeSweep } = require("./jobs/examOutcomeSweep");
 
 const PORT = process.env.PORT || 3003;
 
@@ -14,6 +15,7 @@ app.listen(PORT, async () => {
         console.log(`เชื่อมฐานข้อมูล "${process.env.DB_NAME}" สำเร็จ`);
         startEntitlementExpirySweep();
         startOrderExpirySweep();
+        startExamOutcomeSweep();
     } catch (err) {
         console.error(`เชื่อมฐานข้อมูล "${process.env.DB_NAME}" ไม่สำเร็จ:`, err.message);
     }

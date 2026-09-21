@@ -1,5 +1,6 @@
 const express = require("express");
 const customerAuthController = require("../controllers/customerAuth.controller");
+const examOutcomeController = require("../controllers/examOutcome.controller");
 const visitController = require("../controllers/visit.controller");
 const storeController = require("../controllers/store.controller");
 const attemptController = require("../controllers/attempt.controller");
@@ -47,6 +48,11 @@ const resetLimiter = rateLimit({
 
 // ขอรหัส OTP ยืนยันอีเมลก่อนสมัคร — จำกัด IP เข้มกว่า register เพราะทุกครั้งที่เรียกคือการส่งอีเมลจริง
 // (เปลืองโควตา SMTP + อาจกลายเป็นเครื่องยิงสแปมใส่คนอื่น) ส่วนลิมิตรายอีเมล 5 ครั้ง/ชม. อยู่ใน controller
+// ตอบแบบสอบถามผลสอบ — token เดาไม่ได้อยู่แล้วที่ 256 บิต ลิมิตนี้กันการยิงรัวๆ เปลือง query เฉยๆ
+const examOutcomeLimiter = rateLimit({
+    name: "exam-outcome", windowMs: 60 * 60 * 1000, max: 60,
+});
+
 const registerOtpLimiter = rateLimit({
     name: "register-otp", windowMs: 60 * 60 * 1000, max: 8,
     message: "ขอรหัสยืนยันถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
@@ -64,6 +70,14 @@ router.post("/V1/store/auth/logout", requireCustomerAuth, customerAuthController
 // จำกัด 3 ครั้ง/ชม./บัญชีใน controller, token ใช้ได้ครั้งเดียวและหมดอายุใน 60 นาที
 router.post("/V1/store/auth/forgot-password", forgotLimiter, customerAuthController.forgotPassword);
 router.post("/V1/store/auth/reset-password", resetLimiter, customerAuthController.resetPassword);
+
+// ตอบผลสอบจริงหลังวันสอบ — **ไม่ต้องล็อกอิน** ใช้ token จากลิงก์ในอีเมล (อัตราการตอบสูงกว่ามาก)
+// สิ่งที่ token นี้ทำได้มีอย่างเดียวคือตอบแบบสอบถามของตัวเอง ไม่เปิดสิทธิ์อะไรในบัญชีอีกเลย
+router.get("/V1/store/exam-outcome", examOutcomeLimiter, examOutcomeController.getMyOutcome);
+router.post("/V1/store/exam-outcome", examOutcomeLimiter, examOutcomeController.submitMyOutcome);
+router.post("/V1/store/exam-outcome/opt-out", examOutcomeLimiter, examOutcomeController.optOut);
+// ตัวเลขผลสอบรวมสำหรับหน้าเว็บ (ซ่อนเองถ้าผู้ตอบยังไม่ถึงเกณฑ์)
+router.get("/V1/store/outcome-stats", examOutcomeController.getPublicStats);
 router.get("/V1/store/me", requireCustomerAuth, customerAuthController.getMe);
 router.put("/V1/store/me", requireCustomerAuth, customerAuthController.updateMyProfile);
 router.put("/V1/store/me/name", requireCustomerAuth, customerAuthController.updateMyName);

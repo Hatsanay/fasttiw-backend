@@ -31,6 +31,7 @@ const { requirePermission } = require("../middlewares/permission.middleware");
 const visitController = require("../controllers/visit.controller");
 const auditLogController = require("../controllers/auditLog.controller");
 const diagnosticsController = require("../controllers/diagnostics.controller");
+const examOutcomeController = require("../controllers/examOutcome.controller");
 const { uploadImage, uploadSpreadsheet } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
 
@@ -313,6 +314,17 @@ router.post(
     requirePermission("grantEntitlement"),
     entitlementController.createBatch
 );
+// ─── รอบสอบ + ผลสอบจริงของลูกค้า ─────────────────────────────────────────────
+// ใช้สิทธิ์ customersManagement เดิม (เป็นเรื่องของการติดตามลูกค้า) ไม่เพิ่ม bit ใหม่ —
+// ตำแหน่ง bit ผูกกับลำดับเมนูแบบหนึ่งต่อหนึ่ง เพิ่มทีต้องแก้ทั้งสองฝั่งพร้อมกัน (ดู CLAUDE.md 6.2.4)
+router.get("/V1/exam-rounds", requireAuth, requirePermission("customersManagement"), examOutcomeController.listRounds);
+router.post("/V1/exam-rounds", requireAuth, requirePermission("customersManagement"), examOutcomeController.createRound);
+router.get("/V1/exam-rounds/:id", requireAuth, requirePermission("customersManagement"), examOutcomeController.getRound);
+router.put("/V1/exam-rounds/:id", requireAuth, requirePermission("customersManagement"), examOutcomeController.updateRound);
+router.delete("/V1/exam-rounds/:id", requireAuth, requirePermission("customersManagement"), examOutcomeController.deleteRound);
+router.post("/V1/exam-rounds/:id/invite", requireAuth, requirePermission("customersManagement"), examOutcomeController.inviteRound);
+router.put("/V1/exam-outcomes/:id/approve", requireAuth, requirePermission("customersManagement"), examOutcomeController.approveOutcome);
+
 // ภาพรวมสิทธิ์ทั้งหมด (ทุกลูกค้า) — ใช้ requirePermission("customersManagement") เหมือนหน้าลูกค้า
 // เพราะเป็นข้อมูลชุดเดียวกัน ไม่แยก permission group ใหม่ให้ role ต้องตั้งค่าเพิ่ม
 router.get(

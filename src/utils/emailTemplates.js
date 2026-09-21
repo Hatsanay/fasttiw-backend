@@ -306,4 +306,43 @@ function buildStaff2faEmail({ code, expiresMinutes, fullname, ip }) {
     };
 }
 
-module.exports = { buildReceiptEmail, buildPasswordResetEmail, buildRegisterOtpEmail, buildStaffResetOtpEmail, buildStaff2faEmail, renderLayout, thaiDateTime, thaiDate, baht };
+/* ─────────────────────────── ถามผลสอบหลังวันสอบ ─────────────────────────── */
+
+// อีเมลนี้ "ขอ" อะไรบางอย่างจากลูกค้าโดยที่เขาไม่ได้อะไรกลับทันที — จึงต้องสั้น ตรง และบอกให้ชัดว่า
+// ใช้เวลาแค่ไหนกับเอาไปทำอะไร ไม่งั้นคนกดลบ · ปุ่มเดียว ไม่มีอย่างอื่นให้ไขว้เขว
+// ถ้อยคำเลี่ยงคำว่า "ข้อสอบจริง/ข้อสอบเก่า" ตามข้อ 8 ของ CLAUDE.md
+function buildExamOutcomeEmail({ customer, roundName, examDate, answerUrl, isReminder = false }) {
+    const name = [customer?.cus_fname, customer?.cus_lname].filter(Boolean).join(" ") || customer?.cus_username || "ลูกค้า";
+    const lead = isReminder
+        ? "ถ้าผลสอบประกาศแล้ว รบกวนกดบอกเราหน่อยได้ไหมครับ ใช้เวลาไม่ถึงนาที"
+        : "สอบเป็นยังไงบ้างครับ รบกวนกดบอกผลให้เราหน่อย ใช้เวลาไม่ถึงนาที";
+
+    const bodyHtml = `
+      <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#8b95a5;margin-bottom:6px;">${escapeHtml(roundName)}</div>
+      <h1 style="margin:0 0 6px;font-size:23px;font-weight:600;color:${INK};">ผลสอบเป็นยังไงบ้าง</h1>
+      <p style="margin:0 0 6px;color:${INK_SOFT};">สวัสดีคุณ${escapeHtml(name)} — ${lead}</p>
+      <p style="margin:0 0 6px;color:${INK_SOFT};">
+        คำตอบของคุณช่วยให้เรารู้ว่าเนื้อหาที่ทำไว้ตรงกับสนามสอบแค่ไหน และเอาไปปรับให้รุ่นต่อไปได้ตรงขึ้น
+        (ยังไม่ประกาศผลก็ตอบได้ เลือก "ยังไม่ประกาศผล" ไว้ก่อน แล้วเรากลับมาถามอีกที)
+      </p>
+
+      ${button(answerUrl, "บอกผลสอบ (ไม่ถึงนาที)")}
+
+      <p style="margin:18px 0 0;color:${INK_SOFT};font-size:13.5px;">
+        วันสอบ: ${thaiDate(examDate)} · ข้อมูลนี้ใช้ภายในเท่านั้น จะเอาข้อความของคุณไปแสดงบนเว็บก็ต่อเมื่อคุณติ๊กยินยอมในหน้าถัดไปเอง
+      </p>
+      <p style="margin:18px 0 0;color:#8b95a5;font-size:12.5px;word-break:break-all;">
+        ถ้ากดปุ่มไม่ได้ ให้คัดลอกลิงก์นี้ไปวางในเบราว์เซอร์: ${escapeHtml(answerUrl)}
+      </p>`;
+
+    return {
+        subject: `${isReminder ? "ผลสอบประกาศแล้วหรือยัง" : "สอบเป็นยังไงบ้าง"} — ${roundName}`,
+        html: renderLayout({
+            title: "ผลสอบเป็นยังไงบ้าง",
+            preheader: "กดบอกผลสอบ ใช้เวลาไม่ถึงนาที",
+            bodyHtml,
+        }),
+    };
+}
+
+module.exports = { buildExamOutcomeEmail, buildReceiptEmail, buildPasswordResetEmail, buildRegisterOtpEmail, buildStaffResetOtpEmail, buildStaff2faEmail, renderLayout, thaiDateTime, thaiDate, baht };
