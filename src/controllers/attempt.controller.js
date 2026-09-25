@@ -67,14 +67,21 @@ async function fetchQuestionsWithChoices(productId) {
 // เหมือน fetchQuestionsWithChoices แต่จำกัดเฉพาะ ques_id ที่ระบุ (เช่น att_question_order ของ attempt
 // หนึ่งอัน หรือคำถามข้อเดียวตอนเปิดเฉลยโหมดฝึก) — ยังคงกรอง ques_status = 'active' เหมือนเดิมทุกจุดที่เคย
 // กรอง เพื่อไม่เปลี่ยนพฤติกรรมเดิม แค่ไม่ต้องดึงคำถามข้ออื่นที่ไม่เกี่ยวกับ attempt นี้มาด้วย
+//
+// รู้ id ล่วงหน้าแล้ว จึงยิงคำถามกับตัวเลือกพร้อมกัน (2026-09-25) แทนรอคำถามเสร็จก่อนค่อยถามตัวเลือก — ลดเวลาเปิดหน้า
+// ทำข้อสอบ/เปิดเฉลยโหมดฝึกลง 1 รอบของฐานข้อมูล · ตัวเลือกของข้อที่ไม่ active ถูกดึงมาด้วยแต่ถูกทิ้งใน
+// assembleQuestionMap (ไม่มีข้อให้แปะ) ผลลัพธ์จึงเหมือนเดิมทุกประการ
 async function fetchQuestionsByIds(questionIds) {
     if (questionIds.length === 0) return {};
-    const [questions] = await pool.query(
-        `SELECT ques_id, ques_text, ques_explanation, ques_image_url, ques_score FROM tb_questions
-         WHERE ques_id IN (?) AND ques_status = 'active'`,
-        [questionIds]
-    );
-    return buildQuestionMap(questions);
+    const [[questions], [choices]] = await Promise.all([
+        pool.query(
+            `SELECT ques_id, ques_text, ques_explanation, ques_image_url, ques_score FROM tb_questions
+             WHERE ques_id IN (?) AND ques_status = 'active'`,
+            [questionIds]
+        ),
+        pool.query(CHOICES_BY_QUESTIONS_SQL, [questionIds]),
+    ]);
+    return assembleQuestionMap(questions, choices);
 }
 
 // จำนวนข้อ "ตัวอย่างฟรี" ต่อชุด = ข้อที่เปิดเฉลยให้คนทั่วไปดูได้โดยไม่ต้องซื้อ — ใช้ร่วมกันทั้งหน้าตัวอย่าง
@@ -94,15 +101,17 @@ async function fetchSampleQuestions(productId, limit) {
     return buildQuestionMap(questions);
 }
 
-async function buildQuestionMap(questions) {
-    // ORDER BY cho_order เพราะลำดับตัวเลือกตอนทำข้อสอบต้องตรงกับที่แอดมินจัดไว้เป๊ะ (ไม่สลับสุ่มแล้ว — ดู
-    // startOrResumeAttempt) — ไม่มี ORDER BY มาก่อนเลย ตอนนั้นไม่มีผลเพราะทุกจุดที่ใช้ map นี้เอาไปสุ่มต่ออยู่ดี
-    const [choices] = await pool.query(
-        `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url
-         FROM tb_choices WHERE cho_question_id IN (?) ORDER BY cho_order ASC`,
-        [questions.length ? questions.map((q) => q.ques_id) : [""]]
-    );
+// ORDER BY cho_order เพราะลำดับตัวเลือกตอนทำข้อสอบต้องตรงกับที่แอดมินจัดไว้เป๊ะ (ไม่สลับสุ่มแล้ว — ดู
+// startOrResumeAttempt) — ไม่มี ORDER BY มาก่อนเลย ตอนนั้นไม่มีผลเพราะทุกจุดที่ใช้ map นี้เอาไปสุ่มต่ออยู่ดี
+const CHOICES_BY_QUESTIONS_SQL = `SELECT cho_id, cho_question_id, cho_text, cho_is_correct, cho_wrong_reason, cho_image_url
+     FROM tb_choices WHERE cho_question_id IN (?) ORDER BY cho_order ASC`;
 
+async function buildQuestionMap(questions) {
+    const [choices] = await pool.query(CHOICES_BY_QUESTIONS_SQL, [questions.length ? questions.map((q) => q.ques_id) : [""]]);
+    return assembleQuestionMap(questions, choices);
+}
+
+function assembleQuestionMap(questions, choices) {
     const questionMap = {};
     for (const q of questions) questionMap[q.ques_id] = { ...q, choices: [] };
     for (const c of choices) questionMap[c.cho_question_id]?.choices.push(c);
@@ -157,13 +166,15 @@ async function loadOwnAttempt(attemptId, customerId) {
 // สร้าง response เต็มของ attempt หนึ่งอัน (ใช้ทั้งตอน start ใหม่และตอน resume/refresh)
 async function buildAttemptResponse(attempt) {
     const questionOrder = parseJsonColumn(attempt.att_question_order) ?? [];
-    const questionMap = await fetchQuestionsByIds(questionOrder);
-
-    const [answers] = await pool.query(
-        `SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct, ans_score
-         FROM tb_attempt_answers WHERE ans_attempt_id = ?`,
-        [attempt.att_id]
-    );
+    // คำถาม+ตัวเลือก กับคำตอบ ไม่ขึ้นต่อกัน — ยิงพร้อมกัน (หน้าทำข้อสอบเรียกทุกครั้งที่เปิด/รีเฟรช)
+    const [questionMap, [answers]] = await Promise.all([
+        fetchQuestionsByIds(questionOrder),
+        pool.query(
+            `SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct, ans_score
+             FROM tb_attempt_answers WHERE ans_attempt_id = ?`,
+            [attempt.att_id]
+        ),
+    ]);
     const answerByQuestion = Object.fromEntries(answers.map((a) => [a.ans_question_id, a]));
 
     const questions = questionOrder
@@ -378,8 +389,12 @@ async function getAttempt(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
+        // ประกอบข้อมูลใบสอบไปพร้อมกับเช็คสิทธิ์ — ไม่มีสิทธิ์ก็ไม่ส่งอะไรออกไป (ข้อมูลที่ประกอบไว้ถูกทิ้ง)
+        // catch เปล่าไว้กัน unhandled rejection ตอนออกก่อน (403 ส่งไปแล้ว ห้ามให้ error นี้ไปตอบซ้ำ)
+        const payloadPromise = buildAttemptResponse(attempt);
+        payloadPromise.catch(() => {});
         if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
-        res.json(await buildAttemptResponse(attempt));
+        res.json(await payloadPromise);
     } catch (err) {
         next(err);
     }
@@ -389,41 +404,51 @@ async function submitAnswer(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
+
+        const questionId = req.params.questionId;
+        const choiceId = req.body?.choice_id || null;
+
+        // endpoint ที่ถูกเรียกบ่อยที่สุดในระบบ (ทุกครั้งที่ลูกค้ากดตัวเลือก) — query ที่ไม่ขึ้นต่อกันยิงพร้อมกัน
+        // (2026-09-25) จาก 6-8 รอบของฐานข้อมูลต่อกันเหลือ 4 · ลำดับการตรวจ/ข้อความ error เหมือนเดิมทุกอย่าง
+        // (สิทธิ์ → สถานะ → คำถาม → ตัวเลือก) · catch เปล่ากัน unhandled rejection ตอนตอบกลับก่อนรอครบ
+        const answerQuery = pool.query(
+            "SELECT ans_id, ans_choice_order FROM tb_attempt_answers WHERE ans_attempt_id = ? AND ans_question_id = ?",
+            [attempt.att_id, questionId]
+        );
+        const choiceQuery = choiceId
+            ? pool.query("SELECT cho_is_correct FROM tb_choices WHERE cho_id = ? AND cho_question_id = ?", [choiceId, questionId])
+            : Promise.resolve([[]]);
+        answerQuery.catch(() => {});
+        choiceQuery.catch(() => {});
+
         if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
         if (attempt.att_status !== "in_progress") {
             return res.status(400).json({ message: "ทำข้อสอบชุดนี้เสร็จไปแล้ว" });
         }
 
-        const questionId = req.params.questionId;
-        const choiceId = req.body?.choice_id || null;
-
-        const [answerRows] = await pool.query(
-            "SELECT ans_id, ans_choice_order FROM tb_attempt_answers WHERE ans_attempt_id = ? AND ans_question_id = ?",
-            [attempt.att_id, questionId]
-        );
+        const [[answerRows], [choiceRows]] = await Promise.all([answerQuery, choiceQuery]);
         if (!answerRows[0]) return res.status(404).json({ message: "ไม่พบคำถามนี้ในชุดข้อสอบนี้" });
 
         let isCorrect = null;
         if (choiceId) {
-            const [choiceRows] = await pool.query(
-                "SELECT cho_is_correct FROM tb_choices WHERE cho_id = ? AND cho_question_id = ?",
-                [choiceId, questionId]
-            );
             if (!choiceRows[0]) return res.status(400).json({ message: "ตัวเลือกนี้ไม่ตรงกับคำถาม" });
             isCorrect = !!choiceRows[0].cho_is_correct;
         }
 
-        await pool.query(
-            "UPDATE tb_attempt_answers SET ans_selected_choice_id = ?, ans_is_correct = ?, ans_answered_at = NOW() WHERE ans_id = ?",
-            [choiceId, isCorrect, answerRows[0].ans_id]
-        );
+        // โหมดฝึก + ตอบแล้ว → คืนเฉลยทันที — ดึงเฉลยพร้อมกับบันทึกคำตอบ
+        const wantsReveal = attempt.att_mode === "practice" && !!choiceId;
+        const [, questionMap] = await Promise.all([
+            pool.query(
+                "UPDATE tb_attempt_answers SET ans_selected_choice_id = ?, ans_is_correct = ?, ans_answered_at = NOW() WHERE ans_id = ?",
+                [choiceId, isCorrect, answerRows[0].ans_id]
+            ),
+            wantsReveal ? fetchQuestionsByIds([questionId]) : null,
+        ]);
 
-        if (attempt.att_mode !== "practice" || !choiceId) {
+        if (!wantsReveal) {
             return res.json({ selected_choice_id: choiceId, reveal: null });
         }
 
-        // โหมดฝึก + ตอบแล้ว → คืนเฉลยทันที
-        const questionMap = await fetchQuestionsByIds([questionId]);
         const question = questionMap[questionId];
         const choiceOrder = parseJsonColumn(answerRows[0].ans_choice_order) ?? [];
         const payload = buildQuestionPayload(question, choiceOrder, { ans_selected_choice_id: choiceId }, true);
