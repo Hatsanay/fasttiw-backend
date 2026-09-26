@@ -538,6 +538,8 @@ async function abandonAttempt(req, res, next) {
 // การทำใหม่มีผลกับเรื่องนี้เรื่องเดียว — ไม่ปนในคะแนน/ประวัติ/จุดอ่อนรายหมวด (พวกนั้นอ่านจาก attempt ตรงๆ)
 // ทุก query ที่ตัดสินว่า "ต้องทบทวนไหม" ต้องอ่านผ่าน mistakeEventsSql() เท่านั้น ห้ามกลับไป JOIN คำตอบเอง
 // ใส่ customer filter ในแต่ละฝั่งของ UNION เอง (ไม่พึ่ง optimizer ดันเงื่อนไขเข้า derived table) → params [cid, cid]
+// ข้อที่แอดมินลบแบบเก็บประวัติ (inactive — 2026-09-26) ไม่ต้องทบทวนอีก ตัดที่นี่ที่เดียว ตัวนับกับรายการจึงตรงกันเสมอ
+// (สถิติคะแนน/จุดอ่อนรายหมวดย้อนหลังไม่ผ่านตรงนี้ ยังนับข้อพวกนั้นตามที่ลูกค้าทำไปจริง)
 const mistakeEventsSql = () => `(
     SELECT a.ans_question_id AS question_id, q.ques_product_id AS product_id, a.ans_is_correct AS is_correct,
            a.ans_selected_choice_id AS choice_id, att.att_submitted_at AS answered_at
@@ -545,11 +547,12 @@ const mistakeEventsSql = () => `(
     JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
     JOIN tb_questions q ON q.ques_id = a.ans_question_id
     WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
+      AND q.ques_status = 'active'
     UNION ALL
     SELECT r.mr_question_id, q.ques_product_id, r.mr_is_correct, r.mr_selected_choice_id, r.mr_created_at
     FROM tb_mistake_retries r
     JOIN tb_questions q ON q.ques_id = r.mr_question_id
-    WHERE r.mr_customer_id = ?
+    WHERE r.mr_customer_id = ? AND q.ques_status = 'active'
 ) ev`;
 const LATEST_CORRECT_SQL = "SUBSTRING_INDEX(GROUP_CONCAT(ev.is_correct ORDER BY ev.answered_at DESC), ',', 1) + 0";
 const WRONG_COUNT_SQL = "SUM(ev.is_correct = 0)";

@@ -12,7 +12,7 @@ async function getAll(req, res, next) {
              FROM tb_bookmarks b
              JOIN tb_questions q ON q.ques_id = b.bmk_question_id
              JOIN tb_products p ON p.prod_id = q.ques_product_id
-             WHERE b.bmk_customer_id = ?
+             WHERE b.bmk_customer_id = ? AND q.ques_status = 'active'
              ORDER BY b.bmk_created_at DESC`,
             [req.customer.cus_id]
         );

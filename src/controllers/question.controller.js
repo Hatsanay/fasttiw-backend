@@ -33,13 +33,14 @@ async function getAll(req, res, next) {
             `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, q.ques_order, q.ques_score, q.ques_status, t.tpc_name AS ques_topic_name
              FROM tb_questions q
              LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
-             WHERE q.ques_product_id = ? AND q.ques_text LIKE ?
+             WHERE q.ques_product_id = ? AND q.ques_status = 'active' AND q.ques_text LIKE ?
              ORDER BY q.ques_order
              LIMIT ? OFFSET ?`,
             [req.params.productId, search, limit, offset]
         );
         const [[{ total }]] = await pool.query(
-            "SELECT COUNT(*) AS total FROM tb_questions WHERE ques_product_id = ? AND ques_text LIKE ?",
+            // ข้อที่ถูก "ลบแบบเก็บประวัติ" (inactive — ดู deleteOrArchiveQuestions) ไม่แสดงในหน้าแอดมิน
+            "SELECT COUNT(*) AS total FROM tb_questions WHERE ques_product_id = ? AND ques_status = 'active' AND ques_text LIKE ?",
             [req.params.productId, search]
         );
 
@@ -86,7 +87,7 @@ async function exportQuestions(req, res, next) {
             `SELECT q.ques_id, q.ques_text, q.ques_explanation, q.ques_image_url, q.ques_score, t.tpc_name AS ques_topic_name
              FROM tb_questions q
              LEFT JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
-             WHERE q.ques_product_id = ?
+             WHERE q.ques_product_id = ? AND q.ques_status = 'active'
              ORDER BY q.ques_order`,
             [req.params.productId]
         );
@@ -524,65 +525,94 @@ async function removeChoiceImage(req, res, next) {
     }
 }
 
-async function remove(req, res, next) {
+const isFkRestrict = (err) => err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED";
+
+// ลบคำถาม "แบบเก็บประวัติ" (2026-09-26) — ใช้ร่วมกันทั้งลบทีละข้อและลบหลายข้อ
+//
+// เดิมลบแถวทิ้งตรงๆ ข้อที่มีลูกค้าเคยทำ/bookmark ไว้จึงลบไม่ได้เลย (FK RESTRICT) แอดมินลบทั้งชุดเพื่อนำเข้าใหม่
+// ไม่ได้ · ตอนนี้แต่ละข้อลองลบจริงก่อน — ฐานข้อมูลปฏิเสธเพราะมีประวัติลูกค้าชี้อยู่ = เปลี่ยนเป็น
+// ques_status 'inactive' แทน: หายจากชุดข้อสอบ/หน้าแอดมิน/ข้อที่ต้องทบทวน/bookmark ทุกที่ (ทุก query ฝั่งลูกค้ากรอง
+// active อยู่แล้ว) แต่ **คำตอบและคะแนนของลูกค้าที่ทำไปแล้วอยู่ครบ** (คะแนนถูก freeze ไว้ตอนทำ — ดู CLAUDE.md ข้อ 5.1)
+//
+// ลองลบจริงแล้วดูผล (ไม่ไล่เช็คตารางที่ชี้มาเอง) โดยตั้งใจ — วันหนึ่งมีตารางใหม่ผูก FK มาที่คำถามก็ยังถูกต้องเอง
+// และไม่มีช่องว่างที่ลูกค้าเริ่มทำข้อสอบแทรกระหว่าง "เช็ค" กับ "ลบ" · SAVEPOINT ต่อข้อทำให้ข้อที่ลบไม่ได้
+// ไม่ล้มทั้งชุด ส่วน error อื่นยัง rollback ทั้งหมดตามเดิม (ไม่มีครึ่งๆ กลางๆ)
+//
+// รูปของข้อที่ถูกซ่อนเก็บไว้ (เผื่อต้องเปิดดูย้อนหลัง/กู้คืน) ลบไฟล์เฉพาะข้อที่ลบจริง หลัง commit แล้วเท่านั้น
+async function deleteOrArchiveQuestions(quesIds) {
+    const conn = await pool.getConnection();
+    const deleted = [];
+    const archived = [];
+    let imagePaths = [];
     try {
-        // เก็บ path รูปคำถาม+รูปตัวเลือกไว้ก่อนลบ เพราะ ON DELETE CASCADE บน tb_choices จะลบแถวทิ้งไปเลย
-        // ถ้าไม่ query เก็บไว้ก่อนจะไม่มีทางรู้ path ไฟล์เพื่อไปลบตามทีหลัง
-        const [[quesRow]] = await pool.query("SELECT ques_image_url FROM tb_questions WHERE ques_id = ?", [req.params.id]);
-        const [choiceRows] = await pool.query(
-            "SELECT cho_image_url FROM tb_choices WHERE cho_question_id = ? AND cho_image_url IS NOT NULL",
-            [req.params.id]
+        await conn.beginTransaction();
+        // เก็บ path รูปไว้ก่อน — ON DELETE CASCADE บน tb_choices ลบแถวทิ้งไปเลย ลบแล้วจะไม่รู้ path ไฟล์
+        const [quesRows] = await conn.query(
+            "SELECT ques_id, ques_image_url FROM tb_questions WHERE ques_id IN (?) AND ques_image_url IS NOT NULL",
+            [quesIds]
+        );
+        const [choiceRows] = await conn.query(
+            "SELECT cho_question_id AS ques_id, cho_image_url FROM tb_choices WHERE cho_question_id IN (?) AND cho_image_url IS NOT NULL",
+            [quesIds]
         );
 
-        // ลบคำถามได้เลย — tb_choices ผูก ON DELETE CASCADE ไว้แล้ว ตัวเลือกจะหายตามไปเองโดยไม่ต้องลบมือ
-        await pool.query("DELETE FROM tb_questions WHERE ques_id = ?", [req.params.id]);
-
-        // ลบไฟล์รูปคำถาม+รูปตัวเลือกทั้งหมดทิ้งด้วย ไม่ให้ค้างอยู่ใน uploads/ เปล่าๆ หลังลบคำถาม
-        if (quesRow?.ques_image_url) {
-            await fs.unlink(resolveUploadPath(quesRow.ques_image_url)).catch(() => {});
+        for (const id of quesIds) {
+            await conn.query("SAVEPOINT del_question");
+            try {
+                const [r] = await conn.query("DELETE FROM tb_questions WHERE ques_id = ?", [id]);
+                if (r.affectedRows) deleted.push(id);
+            } catch (err) {
+                if (!isFkRestrict(err)) throw err;
+                await conn.query("ROLLBACK TO SAVEPOINT del_question");
+                const [r] = await conn.query("UPDATE tb_questions SET ques_status = 'inactive' WHERE ques_id = ?", [id]);
+                if (r.affectedRows) archived.push(id);
+            }
         }
-        await Promise.all(choiceRows.map((r) => fs.unlink(resolveUploadPath(r.cho_image_url)).catch(() => {})));
+        await conn.commit();
 
-        res.status(204).end();
+        const deletedSet = new Set(deleted);
+        imagePaths = [
+            ...quesRows.filter((r) => deletedSet.has(r.ques_id)).map((r) => r.ques_image_url),
+            ...choiceRows.filter((r) => deletedSet.has(r.ques_id)).map((r) => r.cho_image_url),
+        ];
     } catch (err) {
-        if (err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED") {
-            return res.status(409).json({ message: "ไม่สามารถลบคำถามนี้ได้ เพราะมีการทำข้อสอบผูกอยู่แล้ว" });
-        }
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
+    await Promise.all(imagePaths.map((p) => fs.unlink(resolveUploadPath(p)).catch(() => {})));
+    return { deleted: deleted.length, archived: archived.length };
+}
+
+// ข้อความตอบกลับที่แอดมินเห็น — บอกตรงๆ ว่าข้อไหนลบจริง ข้อไหนถูกซ่อน และทำไม
+function deleteResultMessage({ deleted, archived }) {
+    if (deleted + archived === 0) return "ไม่พบคำถามที่เลือก (อาจถูกลบไปแล้ว)";
+    const parts = [];
+    if (deleted) parts.push(`ลบ ${deleted} ข้อ`);
+    if (archived) parts.push(`ซ่อน ${archived} ข้อที่มีลูกค้าเคยทำไว้ (ประวัติและคะแนนของลูกค้ายังอยู่ครบ)`);
+    return parts.join(" · ");
+}
+
+async function remove(req, res, next) {
+    try {
+        const result = await deleteOrArchiveQuestions([req.params.id]);
+        res.json({ ...result, message: deleteResultMessage(result) });
+    } catch (err) {
         next(err);
     }
 }
 
-// ลบหลายข้อพร้อมกัน (ติ๊กเลือกจากหน้ารายการคำถาม) — DELETE ... WHERE ques_id IN (?) เป็น statement เดียว
-// ถ้ามีข้อไหนติด RESTRICT (มีคนทำข้อสอบไปแล้ว) ทั้ง statement จะ rollback หมด ไม่ลบบางส่วนค้างไว้ครึ่งๆ
-// กลางๆ — เหมือนพฤติกรรม remove() เดี่ยวๆ แค่ขยายเป็นหลายข้อ
+// ลบหลายข้อพร้อมกัน (ติ๊กเลือกจากหน้ารายการคำถาม)
 async function removeBatch(req, res, next) {
     try {
         const { ques_ids } = req.body;
         if (!Array.isArray(ques_ids) || ques_ids.length === 0) {
             return res.status(400).json({ message: "กรุณาเลือกคำถามที่จะลบ" });
         }
-
-        const [quesRows] = await pool.query(
-            "SELECT ques_image_url FROM tb_questions WHERE ques_id IN (?) AND ques_image_url IS NOT NULL",
-            [ques_ids]
-        );
-        const [choiceRows] = await pool.query(
-            "SELECT cho_image_url FROM tb_choices WHERE cho_question_id IN (?) AND cho_image_url IS NOT NULL",
-            [ques_ids]
-        );
-
-        const [result] = await pool.query("DELETE FROM tb_questions WHERE ques_id IN (?)", [ques_ids]);
-
-        await Promise.all([
-            ...quesRows.map((r) => fs.unlink(resolveUploadPath(r.ques_image_url)).catch(() => {})),
-            ...choiceRows.map((r) => fs.unlink(resolveUploadPath(r.cho_image_url)).catch(() => {})),
-        ]);
-
-        res.json({ message: `ลบคำถาม ${result.affectedRows} ข้อสำเร็จ` });
+        const result = await deleteOrArchiveQuestions(ques_ids);
+        res.json({ ...result, message: deleteResultMessage(result) });
     } catch (err) {
-        if (err.code === "ER_ROW_IS_REFERENCED_2" || err.code === "ER_ROW_IS_REFERENCED") {
-            return res.status(409).json({ message: "ไม่สามารถลบได้ เพราะมีคำถามบางข้อที่เลือกมีการทำข้อสอบผูกอยู่แล้ว" });
-        }
         next(err);
     }
 }
