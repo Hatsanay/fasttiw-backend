@@ -82,6 +82,8 @@ const PERMISSION_KEYS = [
     "mockExamsManagement",
     // ประวัติการแก้ไขข้อมูล (audit log, 2026-09-20) — ต่อท้ายเสมอ
     "auditLogs",
+    // เปิดใช้งานระบบ (เปิด/ปิดฟีเจอร์, 2026-09-27) — ต่อท้ายเสมอ แสดงเป็นเมนูย่อยของ "ตั้งค่าระบบ"
+    "featureFlags",
 ];
 
 const BIT_INDEX = Object.fromEntries(PERMISSION_KEYS.map((key, i) => [key, i]));

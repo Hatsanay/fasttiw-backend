@@ -11,6 +11,7 @@ const newsController = require("../controllers/news.controller");
 const chatController = require("../controllers/chat.controller");
 const diagnosticController = require("../controllers/diagnostic.controller");
 const mockExamController = require("../controllers/mockExam.controller");
+const featureFlagController = require("../controllers/featureFlag.controller");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
 const { uploadImage } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
@@ -78,6 +79,8 @@ router.post("/V1/store/exam-outcome", examOutcomeLimiter, examOutcomeController.
 router.post("/V1/store/exam-outcome/opt-out", examOutcomeLimiter, examOutcomeController.optOut);
 // ตัวเลขผลสอบรวมสำหรับหน้าเว็บ (ซ่อนเองถ้าผู้ตอบยังไม่ถึงเกณฑ์)
 router.get("/V1/store/outcome-stats", examOutcomeController.getPublicStats);
+// ฟีเจอร์ที่เปิด/ปิดอยู่ (เมนู "เปิดใช้งานระบบ" ฝั่งแอดมิน) — ส่งเฉพาะตัวที่ตั้ง exposeToStore, tiwwai-store cache ~1 นาที
+router.get("/V1/store/feature-flags", featureFlagController.storeStates);
 router.get("/V1/store/me", requireCustomerAuth, customerAuthController.getMe);
 router.put("/V1/store/me", requireCustomerAuth, customerAuthController.updateMyProfile);
 router.put("/V1/store/me/name", requireCustomerAuth, customerAuthController.updateMyName);
