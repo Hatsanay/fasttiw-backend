@@ -154,7 +154,7 @@ async function requireStillEntitled(customerId, productId, res) {
 // 403 กันคนเดา attempt id ของคนอื่นแล้วรู้ว่ามี id นี้จริง)
 async function loadOwnAttempt(attemptId, customerId) {
     const [rows] = await pool.query(
-        `SELECT att_id, att_customer_id, att_product_id, att_mock_exam_id, att_mode, att_status, att_question_order,
+        `SELECT att_id, att_customer_id, att_product_id, att_mock_exam_id, att_paper_form_id, att_mode, att_status, att_question_order,
                 att_score, att_earned_score, att_max_score, att_total_questions,
                 att_time_limit_minutes, att_started_at, att_submitted_at
          FROM tb_attempts WHERE att_id = ? AND att_customer_id = ?`,
@@ -458,6 +458,21 @@ async function submitAnswer(req, res, next) {
     }
 }
 
+// คิดคะแนนตอนส่ง — ใช้ร่วมกับการตรวจกระดาษคำตอบ (paperForm.controller.js) สูตรจึงมีที่เดียว
+//
+// สองโหมดคิดคะแนน — แยกที่ att_max_score ที่ freeze ไว้ตอนเริ่มทำ ไม่ใช่ค่าปัจจุบันของ product
+// (ถ้าแอดมินเพิ่งเปิด/ปิดระบบคะแนนระหว่างที่ลูกค้ากำลังทำอยู่ ต้องยึดกติกา ณ ตอนเริ่มเสมอ)
+//
+// att_score ยังเป็น "เปอร์เซ็นต์" เหมือนเดิมทั้งสองโหมด — ประวัติเก่าและกราฟหน้า /history จึงใช้ต่อได้
+// โดยไม่ต้องแก้อะไร ส่วนคะแนนดิบเก็บแยกที่ att_earned_score · maxScore ที่คืนเป็น null = ไม่ใช้ระบบคะแนน
+function computeAttemptScore({ maxScore, totalQuestions, correctCount, earnedScore }) {
+    const max = maxScore === null || maxScore === undefined ? null : Number(maxScore);
+    const useScoring = max !== null && max > 0;
+    const earned = useScoring ? Math.round(Number(earnedScore) * 100) / 100 : null;
+    const score = useScoring ? (earned / max) * 100 : totalQuestions > 0 ? (correctCount / totalQuestions) * 100 : 0;
+    return { score, earned, maxScore: useScoring ? max : null };
+}
+
 async function submitAttempt(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
@@ -472,20 +487,12 @@ async function submitAttempt(req, res, next) {
              FROM tb_attempt_answers WHERE ans_attempt_id = ? AND ans_is_correct = TRUE`,
             [attempt.att_id]
         );
-
-        // สองโหมดคิดคะแนน — แยกที่ att_max_score ที่ freeze ไว้ตอนเริ่มทำ ไม่ใช่ค่าปัจจุบันของ product
-        // (ถ้าแอดมินเพิ่งเปิด/ปิดระบบคะแนนระหว่างที่ลูกค้ากำลังทำอยู่ ต้องยึดกติกา ณ ตอนเริ่มเสมอ)
-        //
-        // att_score ยังเป็น "เปอร์เซ็นต์" เหมือนเดิมทั้งสองโหมด — ประวัติเก่าและกราฟหน้า /history จึงใช้ต่อได้
-        // โดยไม่ต้องแก้อะไร ส่วนคะแนนดิบเก็บแยกที่ att_earned_score
-        const maxScore = attempt.att_max_score === null ? null : Number(attempt.att_max_score);
-        const useScoring = maxScore !== null && maxScore > 0;
-        const earned = useScoring ? Math.round(Number(earnedScore) * 100) / 100 : null;
-        const score = useScoring
-            ? (earned / maxScore) * 100
-            : attempt.att_total_questions > 0
-              ? (correctCount / attempt.att_total_questions) * 100
-              : 0;
+        const { score, earned, maxScore } = computeAttemptScore({
+            maxScore: attempt.att_max_score,
+            totalQuestions: attempt.att_total_questions,
+            correctCount,
+            earnedScore,
+        });
 
         await pool.query(
             "UPDATE tb_attempts SET att_status = 'submitted', att_score = ?, att_earned_score = ?, att_submitted_at = NOW() WHERE att_id = ?",
@@ -498,7 +505,7 @@ async function submitAttempt(req, res, next) {
             correct_count: correctCount,
             total_questions: attempt.att_total_questions,
             earned_score: earned,
-            max_score: useScoring ? maxScore : null,
+            max_score: maxScore,
         });
     } catch (err) {
         next(err);
@@ -692,6 +699,10 @@ async function getReview(req, res, next) {
         const [[product]] = attempt.att_mock_exam_id
             ? [[]]
             : await pool.query("SELECT prod_name, prod_pass_percent, prod_pass_min FROM tb_products WHERE prod_id = ?", [attempt.att_product_id]);
+        // ผลตรวจกระดาษคำตอบ — หน้าเฉลยบอกรหัสใบสอบแทนเวลาที่ใช้ (เวลาทำบนกระดาษระบบไม่รู้)
+        const [[paperForm]] = attempt.att_paper_form_id
+            ? await pool.query("SELECT pf_code FROM tb_paper_forms WHERE pf_id = ?", [attempt.att_paper_form_id])
+            : [[null]];
         const [[mockExam]] = attempt.att_mock_exam_id
             ? await pool.query("SELECT me_name, me_pass_percent, me_pass_min FROM tb_mock_exams WHERE me_id = ?", [attempt.att_mock_exam_id])
             : [[]];
@@ -759,6 +770,7 @@ async function getReview(req, res, next) {
             att_id: attempt.att_id,
             att_product_id: attempt.att_product_id,
             att_mock_exam_id: attempt.att_mock_exam_id ?? null,
+            paper_form_code: paperForm?.pf_code ?? null,
             prod_name: product?.prod_name ?? mockExam?.me_name ?? "",
             att_mode: attempt.att_mode,
             att_score: attempt.att_score,
@@ -1514,13 +1526,14 @@ async function exportPrintableQuestions(req, res, next) {
         if (productRows.length === 0) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
 
         const questionMap = await fetchQuestionsWithChoices(productId);
-        // ไม่สลับ: เรียงตาม ques_id/cho_id ให้ได้ลำดับคงที่แน่นอน (SQL ไม่ได้ ORDER BY มาให้)
-        const orderedQuestionIds = shouldShuffle ? shuffle(Object.keys(questionMap)) : Object.keys(questionMap).sort();
+        // ไม่สลับ: ลำดับตามที่แอดมินจัด (ques_order / cho_order — fetchQuestionsWithChoices เรียงมาให้แล้ว) ให้ตรงกับ
+        // หน้าทำข้อสอบออนไลน์ (2026-09-27) · เดิมเรียงตาม ques_id/cho_id ซึ่งไม่ตรงกับออนไลน์ เลขข้อใน PDF กับบนเว็บคนละข้อ
+        const orderedQuestionIds = shouldShuffle ? shuffle(Object.keys(questionMap)) : Object.keys(questionMap);
 
         const questions = orderedQuestionIds.map((quesId) => {
             const question = questionMap[quesId];
             const choiceIds = question.choices.map((c) => c.cho_id);
-            const choiceOrder = shouldShuffle ? shuffle(choiceIds) : choiceIds.sort();
+            const choiceOrder = shouldShuffle ? shuffle(choiceIds) : choiceIds;
             return buildQuestionPayload(question, choiceOrder, null, withAnswers);
         });
 
@@ -1534,7 +1547,7 @@ async function exportPrintableQuestions(req, res, next) {
 
 module.exports = {
     startOrResumeAttempt, startMockAttempt, getReviewPlan, setExamDate, getAttempt, submitAnswer, submitAttempt, abandonAttempt, getReview, getAttemptHistory,
-    getProductSummary, getWeakAreas, getMistakes, getMistakePractice, retryMistake,
+    getProductSummary, getWeakAreas, getMistakes, getMistakePractice, retryMistake, computeAttemptScore,
     fetchQuestionsWithChoices, fetchSampleQuestions, fetchQuestionsByIds, buildQuestionPayload, exportPrintableQuestions,
     SAMPLE_QUESTION_COUNT,
     // สำหรับทดสอบ

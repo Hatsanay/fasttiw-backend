@@ -40,4 +40,21 @@ const uploadSpreadsheet = multer({
     limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
 });
 
-module.exports = { uploadImage, uploadSpreadsheet };
+// ภาพกระดาษคำตอบที่สแกนส่งตรวจ (ระบบสอบกระดาษ — CLAUDE.md ข้อ 6.9) — หน้าเว็บส่งภาพที่ดึงตรงแล้ว ~200KB/หน้า
+// จำกัดจำนวนไฟล์ไว้ด้วย (ชุด 1,000 ข้อ = 10 หน้า) เพราะ .any() ไม่มีเพดานเอง ยิงไฟล์ไม่อั้นจะกินหน่วยความจำ
+const paperScanUpload = multer({
+    storage,
+    fileFilter: imageFileFilter,
+    limits: { fileSize: 5 * 1024 * 1024, files: 20, fields: 5, fieldSize: 256 * 1024 },
+}).any();
+
+// error ของ multer ไม่มี status → errorHandler ตอบ 500 และเก็บลง error log — ที่นี่เป็นความผิดของคำขอ ตอบ 400
+function uploadPaperScans(req, res, next) {
+    paperScanUpload(req, res, (err) => {
+        if (!err) return next();
+        const message = err.code === "LIMIT_FILE_SIZE" ? "ไฟล์ภาพใหญ่เกินไป" : err.message || "ไฟล์ภาพไม่ถูกต้อง";
+        res.status(400).json({ message: `${message} — สแกนใหม่อีกครั้ง` });
+    });
+}
+
+module.exports = { uploadImage, uploadSpreadsheet, uploadPaperScans };

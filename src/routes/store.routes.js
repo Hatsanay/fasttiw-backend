@@ -12,8 +12,10 @@ const chatController = require("../controllers/chat.controller");
 const diagnosticController = require("../controllers/diagnostic.controller");
 const mockExamController = require("../controllers/mockExam.controller");
 const featureFlagController = require("../controllers/featureFlag.controller");
+const paperFormController = require("../controllers/paperForm.controller");
+const { requireFeature } = require("../utils/featureFlags");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
-const { uploadImage } = require("../middlewares/upload.middleware");
+const { uploadImage, uploadPaperScans } = require("../middlewares/upload.middleware");
 const { noStore } = require("../middlewares/noStore.middleware");
 const { rateLimit } = require("../middlewares/rateLimit.middleware");
 
@@ -137,6 +139,25 @@ router.get("/V1/store/my/entitlements", requireCustomerAuth, storeController.get
 // ทำข้อสอบ
 router.post("/V1/store/products/:id/attempts", requireCustomerAuth, attemptController.startOrResumeAttempt);
 router.get("/V1/store/products/:id/export-questions", requireCustomerAuth, attemptController.exportPrintableQuestions);
+// ตรวจกระดาษคำตอบ — ต่อ IP กันยิงอัปโหลดภาพรัวๆ (ใช้งานจริง: 1 ใบ = ส่ง 1-2 ครั้ง แม้สแกนซ้ำก็ไม่ถึง)
+const paperGradeLimiter = rateLimit({
+    name: "paper-grade", windowMs: 60 * 60 * 1000, max: 40,
+    message: "ส่งตรวจถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+// ใบสอบกระดาษ (ระบบสอบกระดาษ — CLAUDE.md ข้อ 6.9) · ปิดฟีเจอร์ paper_exam = 404 เหมือนไม่มี endpoint
+router.post("/V1/store/paper-forms", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.createForm);
+router.get("/V1/store/paper-forms", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.listMyForms);
+router.get("/V1/store/paper-forms/:code/print", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.getPrintData);
+router.get("/V1/store/paper-forms/:code", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.getFormInfo);
+router.post(
+    "/V1/store/paper-forms/:code/grade",
+    paperGradeLimiter,
+    requireCustomerAuth,
+    requireFeature("paper_exam"),
+    uploadPaperScans,
+    paperFormController.gradeForm
+);
+router.get("/V1/store/paper-forms/:code/scans/:page", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.getScanImage);
 // สนามสอบเสมือนจริง — รายการที่ทำได้ + เริ่ม/ทำต่อ (ใบที่ได้ใช้ endpoint attempts ชุดเดิมทั้งหมดต่อจากนี้)
 router.get("/V1/store/mock-exams", requireCustomerAuth, mockExamController.listMockExams);
 router.post("/V1/store/mock-exams/:id/attempts", requireCustomerAuth, attemptController.startMockAttempt);

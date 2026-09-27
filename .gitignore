@@ -9,3 +9,4 @@ uploads/avatars/*
 uploads/products/*
 !uploads/products/.gitkeep
 npm-debug.log
+private/
