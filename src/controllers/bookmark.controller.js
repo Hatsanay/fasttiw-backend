@@ -1,5 +1,9 @@
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
+const { everEntitledSql, hasEverEntitled } = require("../utils/solutionAccess");
+
+// ⚠ หน้า bookmark เปิดเฉลยเต็ม — ทั้งตอนเพิ่มและตอนดึงต้องเช็คว่าเคยมีสิทธิ์ชุดนั้น (utils/solutionAccess.js)
+// เดิม (ก่อน 2026-10-02) รับรหัสข้ออะไรก็ได้ รหัสข้อเป็นเลขเรียงกัน = ใครที่ล็อกอินอยู่ไล่เปิดเฉลยทั้งคลังได้
 
 // คืนครบทั้งเฉลย (ตัวเลือก+เหตุผลตัวเลือกผิด+วิธีคิด) ไม่ใช่แค่ข้อความคำถามเฉยๆ — เพราะจุดประสงค์ของ
 // bookmark คือกลับมา "ทบทวน" ข้อที่เคยพลาด ไม่ผูกกับ attempt ไหนเป็นการเฉพาะ จึงเปิดเฉลยได้เลยไม่ต้อง
@@ -12,7 +16,7 @@ async function getAll(req, res, next) {
              FROM tb_bookmarks b
              JOIN tb_questions q ON q.ques_id = b.bmk_question_id
              JOIN tb_products p ON p.prod_id = q.ques_product_id
-             WHERE b.bmk_customer_id = ? AND q.ques_status = 'active'
+             WHERE b.bmk_customer_id = ? AND q.ques_status = 'active' AND ${everEntitledSql("b.bmk_customer_id", "q.ques_product_id")}
              ORDER BY b.bmk_created_at DESC`,
             [req.customer.cus_id]
         );
@@ -56,6 +60,11 @@ async function getAll(req, res, next) {
 
 async function add(req, res, next) {
     try {
+        const [[question]] = await pool.query("SELECT ques_product_id FROM tb_questions WHERE ques_id = ?", [req.params.questionId]);
+        // ไม่มีข้อนี้ / ไม่มีสิทธิ์ชุดนี้ ตอบเหมือนกัน (ไม่บอกว่ารหัสข้อนี้มีอยู่จริง)
+        if (!question || !(await hasEverEntitled(req.customer.cus_id, question.ques_product_id))) {
+            return res.status(404).json({ message: "ไม่พบข้อสอบนี้" });
+        }
         const bmk_id = await generateId("tb_bookmarks", "BMK");
         await pool.query(
             "INSERT INTO tb_bookmarks (bmk_id, bmk_customer_id, bmk_question_id) VALUES (?, ?, ?)",

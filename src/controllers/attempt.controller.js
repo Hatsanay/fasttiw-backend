@@ -3,6 +3,7 @@ const { toCriterion, judgeAgainstPass } = require("../utils/passCriteria");
 const { pickQuestions } = require("./mockExam.controller");
 const { generateId, generateIds } = require("../utils/generateId");
 const { hasActiveEntitlement } = require("./entitlement.controller");
+const { everEntitledSql } = require("../utils/solutionAccess");
 
 // mysql2 ปกติจะ auto-parse คอลัมน์ JSON ให้เป็น array/object อยู่แล้ว แต่กันไว้เผื่อ driver
 // บางเวอร์ชันคืนมาเป็น string ดิบ
@@ -547,6 +548,8 @@ async function abandonAttempt(req, res, next) {
 // ใส่ customer filter ในแต่ละฝั่งของ UNION เอง (ไม่พึ่ง optimizer ดันเงื่อนไขเข้า derived table) → params [cid, cid]
 // ข้อที่แอดมินลบแบบเก็บประวัติ (inactive — 2026-09-26) ไม่ต้องทบทวนอีก ตัดที่นี่ที่เดียว ตัวนับกับรายการจึงตรงกันเสมอ
 // (สถิติคะแนน/จุดอ่อนรายหมวดย้อนหลังไม่ผ่านตรงนี้ ยังนับข้อพวกนั้นตามที่ลูกค้าทำไปจริง)
+// รายการนี้เปิดเฉลยเต็ม — นับเฉพาะชุดที่ลูกค้าเคยมีสิทธิ์และไม่ถูกยกเลิก (utils/solutionAccess.js · 2026-10-02)
+// ไม่งั้นสมาชิกกลุ่มสอบกระดาษที่ไม่ได้ซื้อชุด ตรวจกระดาษแล้วได้เฉลยของข้อที่ผิดไปฟรี
 const mistakeEventsSql = () => `(
     SELECT a.ans_question_id AS question_id, q.ques_product_id AS product_id, a.ans_is_correct AS is_correct,
            a.ans_selected_choice_id AS choice_id, att.att_submitted_at AS answered_at
@@ -554,12 +557,12 @@ const mistakeEventsSql = () => `(
     JOIN tb_attempts att ON att.att_id = a.ans_attempt_id
     JOIN tb_questions q ON q.ques_id = a.ans_question_id
     WHERE att.att_customer_id = ? AND att.att_status = 'submitted' AND a.ans_is_correct IS NOT NULL
-      AND q.ques_status = 'active'
+      AND q.ques_status = 'active' AND ${everEntitledSql("att.att_customer_id", "q.ques_product_id")}
     UNION ALL
     SELECT r.mr_question_id, q.ques_product_id, r.mr_is_correct, r.mr_selected_choice_id, r.mr_created_at
     FROM tb_mistake_retries r
     JOIN tb_questions q ON q.ques_id = r.mr_question_id
-    WHERE r.mr_customer_id = ? AND q.ques_status = 'active'
+    WHERE r.mr_customer_id = ? AND q.ques_status = 'active' AND ${everEntitledSql("r.mr_customer_id", "q.ques_product_id")}
 ) ev`;
 const LATEST_CORRECT_SQL = "SUBSTRING_INDEX(GROUP_CONCAT(ev.is_correct ORDER BY ev.answered_at DESC), ',', 1) + 0";
 const WRONG_COUNT_SQL = "SUM(ev.is_correct = 0)";
@@ -682,13 +685,21 @@ async function getReview(req, res, next) {
     try {
         const attempt = await loadOwnAttempt(req.params.id, req.customer.cus_id);
         if (!attempt) return res.status(404).json({ message: "ไม่พบการทำข้อสอบนี้" });
-        if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) return;
+        // ผลสอบกระดาษของคนที่ไม่มีสิทธิ์ชุดนั้น (สมาชิกกลุ่มสอบกระดาษที่ยังไม่ซื้อ — CLAUDE.md ข้อ 6.9.1) เห็นคะแนน /
+        // ผ่านไหม / ผลรายหมวดได้ แต่ **ไม่เห็นรายข้อเลย** (ไม่ส่ง questions มา — แม้แค่ถูก/ผิดรายข้อก็บอกเฉลยของข้อที่ตอบถูก)
+        // ใบออนไลน์/สนามสอบยังเป็นกติกาเดิม: สิทธิ์หมด = 403
+        let solutionsLocked = false;
+        if (attempt.att_mode === "paper") {
+            solutionsLocked = !(await hasActiveEntitlement(req.customer.cus_id, attempt.att_product_id));
+        } else if (!(await requireStillEntitledForAttempt(req.customer.cus_id, attempt, res))) {
+            return;
+        }
         if (attempt.att_status !== "submitted") {
             return res.status(400).json({ message: "ยังไม่ได้ส่งคำตอบ ดูเฉลยไม่ได้" });
         }
 
         const questionOrder = parseJsonColumn(attempt.att_question_order) ?? [];
-        const questionMap = await fetchQuestionsByIds(questionOrder);
+        const questionMap = solutionsLocked ? {} : await fetchQuestionsByIds(questionOrder);
         const [answers] = await pool.query(
             "SELECT ans_question_id, ans_selected_choice_id, ans_choice_order, ans_is_correct, ans_score FROM tb_attempt_answers WHERE ans_attempt_id = ?",
             [attempt.att_id]
@@ -783,7 +794,17 @@ async function getReview(req, res, next) {
             prev_score: prev?.att_score ?? null,
             // จำนวนข้อของชุดนี้ที่ยังตอบผิดอยู่ (นับข้ามทุกครั้งที่ทำ ไม่ใช่เฉพาะใบนี้) — ใช้กับปุ่มไปหน้าทบทวน
             // ใบสนามสอบดึงข้อจากหลายชุด ตัวเลข "ยังต้องทบทวน" จึงนับรวมทุกชุดที่ลูกค้ามี
-            mistake_count: await countUnresolvedMistakes(req.customer.cus_id, attempt.att_product_id),
+            mistake_count: solutionsLocked ? 0 : await countUnresolvedMistakes(req.customer.cus_id, attempt.att_product_id),
+            // true = ไม่มีสิทธิ์ชุดนี้ ไม่มีรายข้อ/เฉลย — หน้าเว็บแสดงสรุป + ชวนซื้อชุด
+            solutions_locked: solutionsLocked,
+            // ตอนล็อก หน้าเว็บนับถูก/ผิด/ไม่ตอบจากรายข้อไม่ได้ — ส่งยอดรวมมาแทน (ยอดรวมไม่บอกว่าข้อไหนถูก)
+            answer_counts: solutionsLocked
+                ? {
+                      correct: answers.filter((a) => a.ans_is_correct).length,
+                      wrong: answers.filter((a) => a.ans_selected_choice_id && !a.ans_is_correct).length,
+                      skipped: answers.filter((a) => !a.ans_selected_choice_id).length,
+                  }
+                : null,
             // null = ชุดนี้ไม่ได้ตั้งเกณฑ์ผ่าน / ไม่ใช่โหมดจับเวลา — หน้าเว็บซ่อนส่วนนั้นไปเลย
             readiness: buildReadiness(
                 attempt, toCriterion(

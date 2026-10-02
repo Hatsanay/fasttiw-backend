@@ -13,6 +13,7 @@ const diagnosticController = require("../controllers/diagnostic.controller");
 const mockExamController = require("../controllers/mockExam.controller");
 const featureFlagController = require("../controllers/featureFlag.controller");
 const paperFormController = require("../controllers/paperForm.controller");
+const paperGroupController = require("../controllers/paperGroup.controller");
 const { requireFeature } = require("../utils/featureFlags");
 const { requireCustomerAuth, optionalCustomerAuth } = require("../middlewares/customerAuth.middleware");
 const { uploadImage, uploadPaperScans } = require("../middlewares/upload.middleware");
@@ -141,7 +142,8 @@ router.post("/V1/store/products/:id/attempts", requireCustomerAuth, attemptContr
 router.get("/V1/store/products/:id/export-questions", requireCustomerAuth, attemptController.exportPrintableQuestions);
 // ตรวจกระดาษคำตอบ — ต่อ IP กันยิงอัปโหลดภาพรัวๆ (ใช้งานจริง: 1 ใบ = ส่ง 1-2 ครั้ง แม้สแกนซ้ำก็ไม่ถึง)
 const paperGradeLimiter = rateLimit({
-    name: "paper-grade", windowMs: 60 * 60 * 1000, max: 40,
+    // 120: ผู้จัดกลุ่มสอบกระดาษสแกนทั้งกอง (สูงสุด 50 คน + สแกนซ้ำ) จากเครื่องเดียว — CLAUDE.md ข้อ 6.9.1
+    name: "paper-grade", windowMs: 60 * 60 * 1000, max: 120,
     message: "ส่งตรวจถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
 });
 // ใบสอบกระดาษ (ระบบสอบกระดาษ — CLAUDE.md ข้อ 6.9) · ปิดฟีเจอร์ paper_exam = 404 เหมือนไม่มี endpoint
@@ -158,6 +160,27 @@ router.post(
     paperFormController.gradeForm
 );
 router.get("/V1/store/paper-forms/:code/scans/:page", requireCustomerAuth, requireFeature("paper_exam"), paperFormController.getScanImage);
+
+// กลุ่มสอบกระดาษ (ชวนเพื่อนสอบพร้อมกัน — CLAUDE.md ข้อ 6.9.1) · ต้องเปิดทั้งระบบสอบกระดาษและสวิตช์กลุ่ม
+// ดูรหัสเชิญจำกัดต่อ IP — กันไล่เดารหัสเพื่อดูชื่อกลุ่ม/ผู้จัด
+const paperGroupJoinLimiter = rateLimit({
+    name: "paper-group-join", windowMs: 10 * 60 * 1000, max: 40,
+    message: "เปิดลิงก์กลุ่มถี่เกินไป กรุณารอสักครู่แล้วลองใหม่",
+});
+const paperGroupGate = [requireCustomerAuth, requireFeature("paper_exam"), requireFeature("paper_group_exam")];
+router.get("/V1/store/paper-groups/join/:code", paperGroupJoinLimiter, ...paperGroupGate, paperGroupController.previewJoin);
+router.post("/V1/store/paper-groups/join/:code", paperGroupJoinLimiter, ...paperGroupGate, paperGroupController.joinGroup);
+router.post("/V1/store/paper-groups", ...paperGroupGate, paperGroupController.createGroup);
+router.get("/V1/store/paper-groups", ...paperGroupGate, paperGroupController.listMyGroups);
+router.get("/V1/store/paper-groups/:id", ...paperGroupGate, paperGroupController.getGroup);
+router.put("/V1/store/paper-groups/:id", ...paperGroupGate, paperGroupController.updateGroup);
+router.post("/V1/store/paper-groups/:id/code", ...paperGroupGate, paperGroupController.regenerateCode);
+router.delete("/V1/store/paper-groups/:id", ...paperGroupGate, paperGroupController.deleteGroup);
+router.delete("/V1/store/paper-groups/:id/members/:customerId", ...paperGroupGate, paperGroupController.removeMember);
+router.post("/V1/store/paper-groups/:id/forms", ...paperGroupGate, paperGroupController.generateForms);
+router.post("/V1/store/paper-groups/:id/round", ...paperGroupGate, paperGroupController.startNewRound);
+router.get("/V1/store/paper-groups/:id/sheets", ...paperGroupGate, paperGroupController.getGroupSheets);
+router.get("/V1/store/paper-groups/:id/booklet", ...paperGroupGate, paperGroupController.getGroupBooklet);
 // สนามสอบเสมือนจริง — รายการที่ทำได้ + เริ่ม/ทำต่อ (ใบที่ได้ใช้ endpoint attempts ชุดเดิมทั้งหมดต่อจากนี้)
 router.get("/V1/store/mock-exams", requireCustomerAuth, mockExamController.listMockExams);
 router.post("/V1/store/mock-exams/:id/attempts", requireCustomerAuth, attemptController.startMockAttempt);

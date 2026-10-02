@@ -34,6 +34,60 @@ function shuffle(array) {
     return a;
 }
 
+/**
+ * ข้อสอบของชุดที่พิมพ์เป็นกระดาษได้ ตามลำดับที่แอดมินจัด (ques_order / cho_order)
+ * คืน { base } = { questionIds, choicesById } หรือ { error } ถ้าชุดนี้ยังพิมพ์ไม่ได้ — ใช้ร่วมกับใบสอบของกลุ่ม
+ */
+async function loadPrintableQuestions(productId) {
+    // fetchQuestionsWithChoices คืนตามลำดับที่แอดมินจัดอยู่แล้ว
+    const questionMap = await fetchQuestionsWithChoices(productId);
+    const ids = Object.keys(questionMap);
+    if (ids.length === 0) return { error: "ชุดนี้ยังไม่มีข้อสอบ" };
+    const tooMany = ids.filter((id) => questionMap[id].choices.length > MAX_CHOICES_ON_PAPER);
+    if (tooMany.length) {
+        return { error: `ชุดนี้มี ${tooMany.length} ข้อที่มีตัวเลือกเกิน ${MAX_CHOICES_ON_PAPER} ตัว ยังพิมพ์เป็นกระดาษคำตอบไม่ได้ — ทำบนเว็บแทนได้` };
+    }
+    // ข้อที่ไม่มีตัวเลือกเลยฝนไม่ได้ — ไม่ใส่ในใบสอบ
+    const questionIds = ids.filter((id) => questionMap[id].choices.length > 0);
+    const choicesById = Object.fromEntries(questionIds.map((id) => [id, questionMap[id].choices.map((c) => c.cho_id)]));
+    return { base: { questionIds, choicesById } };
+}
+
+/** ลำดับข้อ/ตัวเลือกของใบสอบ 1 ใบ — ไม่สลับ = ตามที่แอดมินจัด (ตรงกับออนไลน์) */
+function makeFormOrder(base, shouldShuffle) {
+    const questionIds = shouldShuffle ? shuffle(base.questionIds) : [...base.questionIds];
+    const choiceOrders = Object.fromEntries(
+        questionIds.map((id) => [id, shouldShuffle ? shuffle(base.choicesById[id]) : [...base.choicesById[id]]])
+    );
+    return { questionIds, choiceOrders };
+}
+
+/**
+ * บันทึกใบสอบ 1 ใบ (ใช้ได้ทั้ง pool และ connection ใน transaction) — คืนรหัสใบสอบ
+ * รหัสสุ่ม 5 ตัวจาก 31 ตัวอักษร (~28 ล้านแบบ) ชนกันยากมาก แต่ถ้าชนก็สุ่มใหม่ (unique key ที่ pf_code)
+ */
+async function insertForm(db, { pfId, customerId, productId, order, shuffled, groupId = null, round = null, variant = null }) {
+    const pages = Math.ceil(order.questionIds.length / QUESTIONS_PER_PAGE);
+    for (let attempt = 0; ; attempt++) {
+        const code = randomCode();
+        try {
+            await db.query(
+                `INSERT INTO tb_paper_forms
+                    (pf_id, pf_code, pf_customer_id, pf_product_id, pf_group_id, pf_group_round, pf_variant,
+                     pf_question_ids, pf_choice_orders, pf_shuffled, pf_pages, pf_layout_version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    pfId, code, customerId, productId, groupId, round, variant,
+                    JSON.stringify(order.questionIds), JSON.stringify(order.choiceOrders), shuffled ? 1 : 0, pages, LAYOUT_VERSION,
+                ]
+            );
+            return { code, pages };
+        } catch (err) {
+            if (err.code !== "ER_DUP_ENTRY" || !String(err.message).includes("uq_pf_code") || attempt >= 4) throw err;
+        }
+    }
+}
+
 // POST /V1/store/paper-forms  { product_id, shuffle }
 async function createForm(req, res, next) {
     try {
@@ -45,8 +99,9 @@ async function createForm(req, res, next) {
         if (!(await hasActiveEntitlement(customerId, productId))) {
             return res.status(403).json({ message: "ยังไม่มีสิทธิ์ใช้ชุดข้อสอบนี้ หรือสิทธิ์หมดอายุแล้ว" });
         }
+        // นับเฉพาะใบส่วนตัว — ใบของกลุ่มมีเพดานของกลุ่มเอง (paperGroup.controller.js)
         const [[{ recent }]] = await pool.query(
-            "SELECT COUNT(*) AS recent FROM tb_paper_forms WHERE pf_customer_id = ? AND pf_created_at > NOW() - INTERVAL 1 DAY",
+            "SELECT COUNT(*) AS recent FROM tb_paper_forms WHERE pf_customer_id = ? AND pf_group_id IS NULL AND pf_created_at > NOW() - INTERVAL 1 DAY",
             [customerId]
         );
         if (recent >= MAX_FORMS_PER_DAY) {
@@ -56,49 +111,17 @@ async function createForm(req, res, next) {
         const [[product]] = await pool.query("SELECT prod_name FROM tb_products WHERE prod_id = ?", [productId]);
         if (!product) return res.status(404).json({ message: "ไม่พบชุดข้อสอบนี้" });
 
-        // ลำดับตามที่แอดมินจัด (ques_order / cho_order) — fetchQuestionsWithChoices คืนตามลำดับนั้นอยู่แล้ว
-        const questionMap = await fetchQuestionsWithChoices(productId);
-        const baseOrder = Object.keys(questionMap);
-        if (baseOrder.length === 0) return res.status(400).json({ message: "ชุดนี้ยังไม่มีข้อสอบ" });
-        const tooMany = baseOrder.filter((id) => questionMap[id].choices.length > MAX_CHOICES_ON_PAPER);
-        if (tooMany.length) {
-            return res.status(400).json({
-                message: `ชุดนี้มี ${tooMany.length} ข้อที่มีตัวเลือกเกิน ${MAX_CHOICES_ON_PAPER} ตัว ยังพิมพ์เป็นกระดาษคำตอบไม่ได้ — ทำบนเว็บแทนได้`,
-            });
-        }
-        const empty = baseOrder.filter((id) => questionMap[id].choices.length === 0);
-        const questionIds = (shouldShuffle ? shuffle(baseOrder) : baseOrder).filter((id) => !empty.includes(id));
-        const choiceOrders = Object.fromEntries(
-            questionIds.map((id) => {
-                const ids = questionMap[id].choices.map((c) => c.cho_id);
-                return [id, shouldShuffle ? shuffle(ids) : ids];
-            })
-        );
-        const pages = Math.ceil(questionIds.length / QUESTIONS_PER_PAGE);
-
+        const loaded = await loadPrintableQuestions(productId);
+        if (loaded.error) return res.status(400).json({ message: loaded.error });
+        const order = makeFormOrder(loaded.base, shouldShuffle);
         const pfId = await generateId("tb_paper_forms", "PPF");
-        // รหัสสุ่ม 5 ตัวจาก 31 ตัวอักษร (~28 ล้านแบบ) ชนกันยากมาก แต่ถ้าชนก็สุ่มใหม่ (unique key ที่ pf_code)
-        let code;
-        for (let attempt = 0; attempt < 5; attempt++) {
-            code = randomCode();
-            try {
-                await pool.query(
-                    `INSERT INTO tb_paper_forms
-                        (pf_id, pf_code, pf_customer_id, pf_product_id, pf_question_ids, pf_choice_orders, pf_shuffled, pf_pages, pf_layout_version)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [pfId, code, customerId, productId, JSON.stringify(questionIds), JSON.stringify(choiceOrders), shouldShuffle ? 1 : 0, pages, LAYOUT_VERSION]
-                );
-                break;
-            } catch (err) {
-                if (err.code !== "ER_DUP_ENTRY" || !String(err.message).includes("uq_pf_code") || attempt === 4) throw err;
-            }
-        }
+        const { code, pages } = await insertForm(pool, { pfId, customerId, productId, order, shuffled: shouldShuffle });
 
         res.status(201).json({
             code,
             product_id: productId,
             prod_name: product.prod_name,
-            question_count: questionIds.length,
+            question_count: order.questionIds.length,
             pages,
             shuffled: shouldShuffle,
         });
@@ -123,7 +146,7 @@ async function listMyForms(req, res, next) {
                     a.att_id, a.att_score, a.att_submitted_at AS graded_at
              FROM tb_paper_forms pf JOIN tb_products p ON p.prod_id = pf.pf_product_id
              LEFT JOIN tb_attempts a ON a.att_paper_form_id = pf.pf_id
-             WHERE pf.pf_customer_id = ?${filter}
+             WHERE pf.pf_customer_id = ? AND pf.pf_group_id IS NULL AND pf.pf_status <> 'void'${filter}
              ORDER BY pf.pf_created_at DESC LIMIT 50`,
             params
         );
@@ -133,20 +156,95 @@ async function listMyForms(req, res, next) {
     }
 }
 
-/** ใบสอบของลูกค้าคนนี้ที่ยังมีสิทธิ์ชุดนั้นอยู่ — null พร้อมสถานะ HTTP ถ้าเข้าไม่ได้ */
+/**
+ * ใบสอบที่ลูกค้าคนนี้ตรวจ/ดูได้ — คืน { form, viewer } หรือ { status, message } ถ้าเข้าไม่ได้
+ *   viewer "holder"    = เจ้าของใบ — ใบส่วนตัวต้องยังมีสิทธิ์ชุดนั้น · ใบของกลุ่มต้องยังเป็นสมาชิกกลุ่ม (ไม่ต้องซื้อชุด —
+ *                        สมาชิกที่ไม่ได้ซื้อตรวจได้ เห็นคะแนน แต่หน้าเฉลยไม่เปิดรายข้อ: getReview + utils/solutionAccess.js)
+ *   viewer "organizer" = ผู้จัดของกลุ่มที่ใบนี้สังกัด (สแกนทั้งกอง) — ต้องยังถือสิทธิ์ชุดนั้น
+ * ใบที่ไม่เข้าทางไหนเลยตอบเหมือนไม่มีอยู่ (ไม่บอกว่ามีรหัสนี้จริง)
+ */
 async function loadOwnForm(customerId, code) {
     const [[form]] = await pool.query(
-        `SELECT pf.*, p.prod_name, p.prod_total_score FROM tb_paper_forms pf
+        `SELECT pf.*, p.prod_name, p.prod_total_score, g.pg_owner_id, g.pg_title,
+                c.cus_fname AS holder_fname, c.cus_lname AS holder_lname,
+                (SELECT 1 FROM tb_paper_group_members m WHERE m.pgm_group_id = pf.pf_group_id AND m.pgm_customer_id = pf.pf_customer_id) AS holder_in_group
+         FROM tb_paper_forms pf
          JOIN tb_products p ON p.prod_id = pf.pf_product_id
-         WHERE pf.pf_code = ? AND pf.pf_customer_id = ?`,
-        [String(code || "").toUpperCase(), customerId]
+         JOIN tb_customers c ON c.cus_id = pf.pf_customer_id
+         LEFT JOIN tb_paper_groups g ON g.pg_id = pf.pf_group_id
+         WHERE pf.pf_code = ?`,
+        [String(code || "").toUpperCase()]
     );
-    // ใบสอบของคนอื่นตอบเหมือนไม่มีอยู่ (ไม่บอกว่ามีรหัสนี้จริง)
-    if (!form) return { status: 404, message: "ไม่พบใบสอบนี้" };
-    if (!(await hasActiveEntitlement(customerId, form.pf_product_id))) {
+    const notFound = { status: 404, message: "ไม่พบใบสอบนี้" };
+    if (!form) return notFound;
+    const viewer = form.pf_customer_id === customerId ? "holder" : form.pg_owner_id && form.pg_owner_id === customerId ? "organizer" : null;
+    if (!viewer) return notFound;
+    // ใบของกลุ่มที่ผู้จัดเริ่มรอบใหม่/เอาออก/ลบกลุ่มไปแล้ว — กระดาษแผ่นเก่าตรวจไม่ได้ ต้องใช้ใบของรอบปัจจุบัน
+    if (form.pf_status === "void") return { status: 410, message: "ใบสอบนี้ถูกยกเลิกแล้ว (ผู้จัดเริ่มรอบสอบใหม่) — ใช้กระดาษใบใหม่ที่ผู้จัดพิมพ์ให้" };
+
+    const entitled = await hasActiveEntitlement(customerId, form.pf_product_id);
+    if (viewer === "organizer") {
+        if (!form.holder_in_group) return notFound; // สมาชิกออกจากกลุ่มไปแล้ว ผู้จัดไม่มีสิทธิ์แตะผลของเขาอีก
+        if (!entitled) return { status: 403, message: "สิทธิ์ชุดข้อสอบนี้ของคุณหมดอายุหรือถูกยกเลิกแล้ว — ต่ออายุก่อนถึงจะตรวจกระดาษของกลุ่มได้" };
+    } else if (!entitled && !(form.pf_group_id && form.holder_in_group)) {
         return { status: 403, message: "สิทธิ์ใช้ชุดข้อสอบนี้หมดอายุหรือถูกยกเลิกแล้ว" };
     }
-    return { form };
+    return { form, viewer };
+}
+
+function parseJson(value) {
+    return typeof value === "string" ? JSON.parse(value) : value;
+}
+
+/** จำนวนวงของแต่ละข้อบนกระดาษคำตอบ — จากใบสอบ (ไม่ใช่จากตัวเลือกปัจจุบัน) ผังจึงไม่เปลี่ยนแม้แอดมินแก้ข้อ */
+function formChoiceCounts(form) {
+    const questionIds = parseJson(form.pf_question_ids);
+    const choiceOrders = parseJson(form.pf_choice_orders);
+    return questionIds.map((id) => (choiceOrders[id] || []).length);
+}
+
+/**
+ * ข้อมูลพิมพ์ชุดข้อสอบของใบสอบ 1 ใบ ตามลำดับที่ตรึงไว้ (ไม่มีเฉลย) — form ต้องมี prod_name / prod_total_score
+ * ดึงตามรหัสที่ตรึงไว้ รวมข้อที่แอดมินซ่อนไปแล้วด้วย (สถานะไม่ใช่ active) — ต้องพิมพ์ได้ครบตามลำดับเดิม
+ * ไม่งั้นเลขข้อหลังจากนั้นเลื่อนทั้งหมด ข้อที่ถูกซ่อนแสดงเป็นข้อความแจ้งแทนเนื้อหา
+ */
+async function buildPrintData(form) {
+    const questionIds = parseJson(form.pf_question_ids);
+    const choiceOrders = parseJson(form.pf_choice_orders);
+    const ids = questionIds.length ? questionIds : [""];
+    const [[questions], [choices]] = await Promise.all([
+        pool.query("SELECT ques_id, ques_text, ques_image_url, ques_score, ques_status FROM tb_questions WHERE ques_id IN (?)", [ids]),
+        pool.query("SELECT cho_id, cho_question_id, cho_text, cho_image_url FROM tb_choices WHERE cho_question_id IN (?)", [ids]),
+    ]);
+    const byId = Object.fromEntries(questions.map((q) => [q.ques_id, q]));
+    const choiceById = Object.fromEntries(choices.map((c) => [c.cho_id, c]));
+
+    return {
+        code: form.pf_code,
+        prod_name: form.prod_name,
+        prod_total_score: form.prod_total_score,
+        pages: form.pf_pages,
+        shuffled: !!form.pf_shuffled,
+        variant: form.pf_variant ?? null,
+        choice_counts: formChoiceCounts(form),
+        questions: questionIds.map((id) => {
+            const q = byId[id];
+            const removed = !q || q.ques_status !== "active";
+            return {
+                ques_id: id,
+                ques_text: removed ? "(ข้อนี้ถูกนำออกจากชุดข้อสอบแล้ว — ข้ามข้อนี้ได้ ไม่นับคะแนน)" : q.ques_text,
+                ques_image_url: removed ? null : q.ques_image_url,
+                ques_score: removed ? null : q.ques_score,
+                choices: removed
+                    ? []
+                    : (choiceOrders[id] || [])
+                          .map((cid) => choiceById[cid])
+                          .filter(Boolean)
+                          .map((c) => ({ cho_id: c.cho_id, cho_text: c.cho_text, cho_image_url: c.cho_image_url })),
+                reveal: null,
+            };
+        }),
+    };
 }
 
 // GET /V1/store/paper-forms/:code/print — ข้อมูลสำหรับพิมพ์ PDF ทั้ง 2 ไฟล์ ตามลำดับที่ตรึงไว้ (ไม่มีเฉลย)
@@ -154,56 +252,14 @@ async function getPrintData(req, res, next) {
     try {
         const result = await loadOwnForm(req.customer.cus_id, req.params.code);
         if (!result.form) return res.status(result.status).json({ message: result.message });
-        const { form } = result;
-        const questionIds = typeof form.pf_question_ids === "string" ? JSON.parse(form.pf_question_ids) : form.pf_question_ids;
-        const choiceOrders = typeof form.pf_choice_orders === "string" ? JSON.parse(form.pf_choice_orders) : form.pf_choice_orders;
-
-        // ดึงตามรหัสที่ตรึงไว้ รวมข้อที่แอดมินซ่อนไปแล้วด้วย (สถานะไม่ใช่ active) — ต้องพิมพ์ได้ครบตามลำดับเดิม
-        // ไม่งั้นเลขข้อหลังจากนั้นเลื่อนทั้งหมด ข้อที่ถูกซ่อนแสดงเป็นข้อความแจ้งแทนเนื้อหา
-        const [questions] = await pool.query(
-            "SELECT ques_id, ques_text, ques_image_url, ques_score, ques_status FROM tb_questions WHERE ques_id IN (?)",
-            [questionIds.length ? questionIds : [""]]
-        );
-        const [choices] = await pool.query(
-            "SELECT cho_id, cho_question_id, cho_text, cho_image_url FROM tb_choices WHERE cho_question_id IN (?)",
-            [questionIds.length ? questionIds : [""]]
-        );
-        const byId = Object.fromEntries(questions.map((q) => [q.ques_id, q]));
-        const choiceById = Object.fromEntries(choices.map((c) => [c.cho_id, c]));
-
-        res.json({
-            code: form.pf_code,
-            prod_name: form.prod_name,
-            prod_total_score: form.prod_total_score,
-            pages: form.pf_pages,
-            shuffled: !!form.pf_shuffled,
-            // จำนวนวงของแต่ละข้อบนกระดาษคำตอบ — จากใบสอบ (ไม่ใช่จากตัวเลือกปัจจุบัน) ผังจึงไม่เปลี่ยนแม้แอดมินแก้ข้อ
-            choice_counts: questionIds.map((id) => (choiceOrders[id] || []).length),
-            questions: questionIds.map((id) => {
-                const q = byId[id];
-                const removed = !q || q.ques_status !== "active";
-                return {
-                    ques_id: id,
-                    ques_text: removed ? "(ข้อนี้ถูกนำออกจากชุดข้อสอบแล้ว — ข้ามข้อนี้ได้ ไม่นับคะแนน)" : q.ques_text,
-                    ques_image_url: removed ? null : q.ques_image_url,
-                    ques_score: removed ? null : q.ques_score,
-                    choices: removed
-                        ? []
-                        : (choiceOrders[id] || [])
-                              .map((cid) => choiceById[cid])
-                              .filter(Boolean)
-                              .map((c) => ({ cho_id: c.cho_id, cho_text: c.cho_text, cho_image_url: c.cho_image_url })),
-                    reveal: null,
-                };
-            }),
-        });
+        // ตัวโจทย์พิมพ์ได้เฉพาะคนที่ถือสิทธิ์ชุดนั้น — สมาชิกกลุ่มที่ไม่ได้ซื้อใช้ชุดข้อสอบที่ผู้จัดพิมพ์แจก
+        if (!(await hasActiveEntitlement(req.customer.cus_id, result.form.pf_product_id))) {
+            return res.status(403).json({ message: "ต้องมีสิทธิ์ชุดข้อสอบนี้ถึงจะพิมพ์ชุดข้อสอบได้" });
+        }
+        res.json(await buildPrintData(result.form));
     } catch (err) {
         next(err);
     }
-}
-
-function parseJson(value) {
-    return typeof value === "string" ? JSON.parse(value) : value;
 }
 
 // GET /V1/store/paper-forms/:code — ข้อมูลที่หน้าสแกนต้องใช้อ่านกระดาษ (จำนวนวงต่อข้อ) + ผลตรวจล่าสุด (ถ้ามี)
@@ -228,6 +284,10 @@ async function getFormInfo(req, res, next) {
             created_at: form.pf_created_at,
             result: attempt ? { att_id: attempt.att_id, score: Number(attempt.att_score), graded_at: attempt.att_submitted_at } : null,
             scanned_pages: scans.map((r) => r.ps_page),
+            // ผู้จัดสแกนแทนสมาชิก: หน้าเว็บบอกว่าเป็นใบของใคร และส่งตรวจแล้วกลับหน้ากลุ่ม (หน้าเฉลยเป็นของสมาชิก เปิดไม่ได้)
+            viewer: result.viewer,
+            holder_name: [form.holder_fname, form.holder_lname].filter(Boolean).join(" "),
+            group: form.pf_group_id ? { id: form.pf_group_id, title: form.pg_title, variant: form.pf_variant } : null,
         });
     } catch (err) {
         next(err);
@@ -350,7 +410,8 @@ async function gradeForm(req, res, next) {
                         (att_id, att_customer_id, att_product_id, att_paper_form_id, att_mode, att_status, att_question_order,
                          att_score, att_earned_score, att_max_score, att_total_questions, att_time_limit_minutes, att_started_at, att_submitted_at)
                      VALUES (?, ?, ?, ?, 'paper', 'submitted', ?, ?, ?, ?, ?, NULL, NOW(), NOW())`,
-                    [attId, req.customer.cus_id, form.pf_product_id, form.pf_id, questionOrder, score.toFixed(2), earned, maxScore, rows.length]
+                    // ผลเป็นของเจ้าของใบเสมอ — ผู้จัดสแกนแทน ผลต้องเข้าประวัติของสมาชิกคนนั้น ไม่ใช่ของผู้จัด
+                    [attId, form.pf_customer_id, form.pf_product_id, form.pf_id, questionOrder, score.toFixed(2), earned, maxScore, rows.length]
                 );
             }
             const answerIds = await generateIds("tb_attempt_answers", "ANS", rows.length);
@@ -387,6 +448,7 @@ async function gradeForm(req, res, next) {
             score: Number(score.toFixed(2)),
             correct_count: correctCount,
             total_questions: rows.length,
+            viewer: result.viewer,
         });
     } catch (err) {
         if (savedFiles.length) await deleteScanFiles(savedFiles.map((f) => f.name));
@@ -415,4 +477,19 @@ async function getScanImage(req, res, next) {
     }
 }
 
-module.exports = { createForm, listMyForms, getPrintData, getFormInfo, gradeForm, getScanImage, MAX_CHOICES_ON_PAPER };
+module.exports = {
+    createForm,
+    listMyForms,
+    getPrintData,
+    getFormInfo,
+    gradeForm,
+    getScanImage,
+    // ใช้ร่วมกับใบสอบของกลุ่ม (paperGroup.controller.js)
+    loadPrintableQuestions,
+    makeFormOrder,
+    insertForm,
+    buildPrintData,
+    formChoiceCounts,
+    parseJson,
+    MAX_CHOICES_ON_PAPER,
+};
