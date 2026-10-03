@@ -1,9 +1,11 @@
 const crypto = require("crypto");
+const ExcelJS = require("exceljs");
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { hasActiveEntitlement } = require("./entitlement.controller");
 const { generateIds } = require("../utils/generateId");
 const { loadPrintableQuestions, makeFormOrder, insertForm, buildPrintData, formChoiceCounts, parseJson } = require("./paperForm.controller");
+const { buildReadiness, toCriterion } = require("./attempt.controller");
 
 // กลุ่มสอบกระดาษ — ลูกค้าชวนเพื่อนสอบกระดาษพร้อมกัน (เฟส 1: กลุ่ม + ลิงก์เชิญ + เข้ากลุ่ม + รายชื่อ) — CLAUDE.md ข้อ 6.9.1
 //
@@ -561,6 +563,273 @@ async function getGroupBooklet(req, res, next) {
     }
 }
 
+// ─── ผลสอบของกลุ่ม (เฟส 4) ─────────────────────────────────────────────────────────────────────────
+// ผู้จัดเห็นผลของสมาชิกทุกคน **เรียงตามชื่อ ไม่มีอันดับ** (ผู้จัดก่อน — ลำดับเดียวกับรายชื่อในหน้ากลุ่ม)
+// CLAUDE.md ข้อ 5 ไม่ทำ leaderboard: ไม่มีเลขอันดับ ไม่มีการเรียงตามคะแนน ทั้งในหน้าเว็บและไฟล์ Excel
+//
+// - เห็นเฉพาะสมาชิกที่ **ยังอยู่ในกลุ่ม** — ยอมรับตอนเข้ากลุ่มว่าผู้จัดจะเห็นคะแนน ออกจากกลุ่ม = ถอนความยินยอม
+//   (ผลสอบยังอยู่ในประวัติของเจ้าตัวเหมือนเดิม แค่ผู้จัดไม่เห็นแล้ว)
+// - ไม่ต้องถือสิทธิ์ชุดข้อสอบ — ผลเป็นคะแนน/ผ่านไหม/ผลรายหมวด ไม่มีรายข้อหรือเฉลย (ไม่ส่ง att_id ด้วย:
+//   ผู้จัดเปิดหน้าเฉลยของสมาชิกไม่ได้อยู่แล้ว แต่ไม่ให้มีอะไรชวนลอง)
+// - ผ่าน/ไม่ผ่าน ใช้ buildReadiness ตัวเดียวกับหน้าเฉลยของสมาชิก — ตัวเลขสองหน้าตรงกันเสมอ
+
+/** ผลสอบของรอบหนึ่ง — ใช้ร่วมกันทั้งหน้าเว็บและไฟล์ Excel */
+async function buildGroupResults(group, round) {
+    const [members, [forms], [[product]], [topicCriteria], [roundRows]] = await Promise.all([
+        loadMembers(group),
+        pool.query(
+            `SELECT pf.pf_customer_id, pf.pf_code, pf.pf_variant, pf.pf_status,
+                    a.att_id, a.att_score, a.att_earned_score, a.att_max_score, a.att_total_questions, a.att_submitted_at
+             FROM tb_paper_forms pf
+             LEFT JOIN tb_attempts a ON a.att_paper_form_id = pf.pf_id AND a.att_status = 'submitted'
+             WHERE pf.pf_group_id = ? AND pf.pf_group_round = ? AND pf.pf_status <> 'void'`,
+            [group.pg_id, round]
+        ),
+        pool.query("SELECT prod_pass_percent, prod_pass_min FROM tb_products WHERE prod_id = ?", [group.pg_product_id]),
+        pool.query("SELECT ptp_topic_id, ptp_pass_percent, ptp_pass_min FROM tb_product_topic_pass_criteria WHERE ptp_product_id = ?", [
+            group.pg_product_id,
+        ]),
+        // รอบที่มีใบสอบ (ไม่นับใบที่ถูกยกเลิก) — ให้เลือกดูรอบเก่าได้
+        // ตัวนับ "ตรวจแล้ว" นับเฉพาะคนที่ยังอยู่ในกลุ่ม ให้ตรงกับรายชื่อที่แสดง (คนที่ออกไปแล้วผู้จัดไม่เห็นผล)
+        pool.query(
+            `SELECT pf.pf_group_round AS round, SUM(pf.pf_status = 'graded' AND m.pgm_customer_id IS NOT NULL) AS graded
+             FROM tb_paper_forms pf
+             LEFT JOIN tb_paper_group_members m ON m.pgm_group_id = pf.pf_group_id AND m.pgm_customer_id = pf.pf_customer_id
+             WHERE pf.pf_group_id = ? AND pf.pf_status <> 'void'
+             GROUP BY pf.pf_group_round ORDER BY pf.pf_group_round DESC`,
+            [group.pg_id]
+        ),
+    ]);
+
+    const formOf = new Map(forms.map((f) => [f.pf_customer_id, f]));
+    const memberIds = new Set(members.map((m) => m.customer_id));
+    const attemptIds = forms.filter((f) => f.att_id && memberIds.has(f.pf_customer_id)).map((f) => f.att_id);
+
+    // ผลรายหมวดของทุกใบในคำสั่งเดียว — สูตรเดียวกับ topicRows ใน getReview (COALESCE(ans_score, 1))
+    const [topicRows, correctRows] = attemptIds.length
+        ? await Promise.all([
+              pool
+                  .query(
+                      `SELECT a.ans_attempt_id, t.tpc_id, t.tpc_name,
+                              COUNT(*) AS total,
+                              SUM(a.ans_is_correct) AS correct,
+                              SUM(CASE WHEN a.ans_is_correct THEN COALESCE(a.ans_score, 1) ELSE 0 END) AS earned,
+                              SUM(COALESCE(a.ans_score, 1)) AS possible,
+                              SUM(a.ans_score IS NOT NULL) AS scored_answers
+                       FROM tb_attempt_answers a
+                       JOIN tb_questions q ON q.ques_id = a.ans_question_id
+                       JOIN tb_topics t ON t.tpc_id = q.ques_topic_id
+                       WHERE a.ans_attempt_id IN (?) AND a.ans_is_correct IS NOT NULL
+                       GROUP BY a.ans_attempt_id, t.tpc_id, t.tpc_name`,
+                      [attemptIds]
+                  )
+                  .then(([rows]) => rows),
+              pool
+                  .query(
+                      "SELECT ans_attempt_id, SUM(ans_is_correct) AS correct FROM tb_attempt_answers WHERE ans_attempt_id IN (?) GROUP BY ans_attempt_id",
+                      [attemptIds]
+                  )
+                  .then(([rows]) => rows),
+          ])
+        : [[], []];
+
+    const topicsByAttempt = new Map();
+    for (const t of topicRows) {
+        if (!topicsByAttempt.has(t.ans_attempt_id)) topicsByAttempt.set(t.ans_attempt_id, []);
+        topicsByAttempt.get(t.ans_attempt_id).push(t);
+    }
+    const correctByAttempt = new Map(correctRows.map((r) => [r.ans_attempt_id, Number(r.correct) || 0]));
+    const criterion = toCriterion(product?.prod_pass_percent, product?.prod_pass_min);
+    const hasCriterion = !!criterion || topicCriteria.some((t) => toCriterion(t.ptp_pass_percent, t.ptp_pass_min));
+
+    const rows = members.map((m) => {
+        const f = formOf.get(m.customer_id);
+        const base = {
+            customer_id: m.customer_id,
+            name: m.name,
+            is_owner: m.is_owner,
+            form: f ? { code: f.pf_code, variant: f.pf_variant, status: f.pf_status } : null,
+        };
+        if (!f?.att_id) return { ...base, result: null };
+        const myTopics = topicsByAttempt.get(f.att_id) ?? [];
+        const correct = correctByAttempt.get(f.att_id) ?? 0;
+        const readiness = buildReadiness(f, criterion, correct, myTopics, topicCriteria);
+        const scored = f.att_max_score != null && Number(f.att_max_score) > 0;
+        return {
+            ...base,
+            result: {
+                score: Number(f.att_score),
+                earned: scored ? Number(f.att_earned_score) : null,
+                max: scored ? Number(f.att_max_score) : null,
+                correct,
+                total: Number(f.att_total_questions),
+                // null = ชุดนี้ไม่ได้ตั้งเกณฑ์ผ่าน
+                passed: readiness ? readiness.passed : null,
+                failed_subjects: readiness ? readiness.subjects.filter((s) => !s.passed).map((s) => s.tpc_name) : [],
+                graded_at: f.att_submitted_at,
+                topics: Object.fromEntries(myTopics.map((t) => [t.tpc_id, Math.round((Number(t.earned) / Number(t.possible)) * 100)])),
+            },
+        };
+    });
+
+    // ผลรายหมวดของทั้งกลุ่ม — รวมคะแนนดิบทุกใบแล้วค่อยหาร (ไม่ใช่เฉลี่ยของ %) ตรงกับวิธีคิดผลรายหมวดที่อื่น
+    // เรียงหมวดที่อ่อนสุดก่อน (เรียง "หมวด" ไม่ใช่เรียงคน) — ผู้จัดรู้ทันทีว่าควรติวเรื่องอะไรเพิ่ม
+    const topicAgg = new Map();
+    for (const t of topicRows) {
+        const agg = topicAgg.get(t.tpc_id) ?? { tpc_id: t.tpc_id, tpc_name: t.tpc_name, earned: 0, possible: 0, members: 0 };
+        agg.earned += Number(t.earned);
+        agg.possible += Number(t.possible);
+        agg.members += 1;
+        topicAgg.set(t.tpc_id, agg);
+    }
+    const topics = [...topicAgg.values()]
+        .map((t) => ({ tpc_id: t.tpc_id, tpc_name: t.tpc_name, accuracy: t.possible > 0 ? Math.round((t.earned / t.possible) * 100) : 0, members: t.members }))
+        .sort((a, b) => a.accuracy - b.accuracy || a.tpc_name.localeCompare(b.tpc_name, "th"));
+
+    const graded = rows.filter((r) => r.result);
+    const rounds = roundRows.map((r) => ({ round: Number(r.round), graded: Number(r.graded) }));
+    if (!rounds.some((r) => r.round === group.pg_round)) rounds.unshift({ round: group.pg_round, graded: 0 });
+
+    return {
+        title: group.pg_title,
+        prod_name: group.prod_name,
+        round,
+        current_round: group.pg_round,
+        rounds,
+        has_criterion: hasCriterion,
+        summary: {
+            members: rows.length,
+            with_form: rows.filter((r) => r.form).length,
+            graded: graded.length,
+            average_score: graded.length ? Math.round((graded.reduce((s, r) => s + r.result.score, 0) / graded.length) * 10) / 10 : null,
+            passed: hasCriterion ? graded.filter((r) => r.result.passed).length : null,
+        },
+        topics,
+        members: rows,
+    };
+}
+
+/** ผู้จัดเท่านั้น + รอบที่ขอ (ไม่ส่ง = รอบปัจจุบัน) — ส่งคำตอบ error ให้แล้วคืน null */
+async function loadResultsRequest(req, res) {
+    const loaded = await loadGroupFor(req.customer.cus_id, req.params.id);
+    if (!loaded) {
+        res.status(404).json({ message: "ไม่พบกลุ่มนี้" });
+        return null;
+    }
+    if (loaded.role !== "owner") {
+        res.status(403).json({ message: "เฉพาะผู้จัดเท่านั้น" });
+        return null;
+    }
+    const group = loaded.group;
+    let round = group.pg_round;
+    if (req.query.round !== undefined && req.query.round !== "") {
+        round = Number(req.query.round);
+        if (!Number.isInteger(round) || round < 1 || round > group.pg_round) {
+            res.status(400).json({ message: "รอบสอบไม่ถูกต้อง" });
+            return null;
+        }
+    }
+    return { group, round };
+}
+
+// GET /V1/store/paper-groups/:id/results?round=N
+async function getGroupResults(req, res, next) {
+    try {
+        const loaded = await loadResultsRequest(req, res);
+        if (!loaded) return;
+        res.json(await buildGroupResults(loaded.group, loaded.round));
+    } catch (err) {
+        next(err);
+    }
+}
+
+const FORM_STATUS_TEXT = { printed: "รอตรวจ", graded: "ตรวจแล้ว" };
+
+function formatBangkok(date) {
+    return date
+        ? new Date(date).toLocaleString("th-TH", {
+              timeZone: "Asia/Bangkok",
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+          })
+        : "";
+}
+
+// GET /V1/store/paper-groups/:id/results.xlsx?round=N — ข้อมูลเดียวกับหน้าเว็บ เรียงตามชื่อ ไม่มีคอลัมน์อันดับ
+async function exportGroupResults(req, res, next) {
+    try {
+        const loaded = await loadResultsRequest(req, res);
+        if (!loaded) return;
+        const data = await buildGroupResults(loaded.group, loaded.round);
+        const scored = data.members.some((m) => m.result?.max != null);
+        // หมวดในไฟล์เรียงตามชื่อ (คอลัมน์คงที่ เทียบข้ามรอบง่าย) — หน้าเว็บเรียงหมวดที่อ่อนสุดก่อน
+        const topicCols = [...data.topics].sort((a, b) => a.tpc_name.localeCompare(b.tpc_name, "th"));
+
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet("ผลรายคน");
+        sheet.columns = [
+            { header: "ชื่อ", key: "name", width: 28 },
+            { header: "ชุด", key: "variant", width: 6 },
+            { header: "รหัสใบสอบ", key: "code", width: 12 },
+            { header: "สถานะ", key: "status", width: 14 },
+            { header: "คะแนน (%)", key: "score", width: 11 },
+            ...(scored ? [{ header: "คะแนนที่ได้", key: "points", width: 14 }] : []),
+            { header: "ตอบถูก (ข้อ)", key: "correct", width: 13 },
+            ...(data.has_criterion
+                ? [
+                      { header: "ผลตามเกณฑ์", key: "passed", width: 12 },
+                      { header: "วิชาที่ไม่ผ่าน", key: "failed", width: 24 },
+                  ]
+                : []),
+            { header: "ตรวจเมื่อ", key: "graded_at", width: 22 },
+            ...topicCols.map((t) => ({ header: `${t.tpc_name} (%)`, key: `t_${t.tpc_id}`, width: Math.min(30, Math.max(12, t.tpc_name.length + 5)) })),
+        ];
+        sheet.getRow(1).font = { bold: true };
+        sheet.views = [{ state: "frozen", xSplit: 1, ySplit: 1 }];
+        for (const m of data.members) {
+            const r = m.result;
+            sheet.addRow({
+                name: m.is_owner ? `${m.name} (ผู้จัด)` : m.name,
+                variant: m.form?.variant ?? "",
+                code: m.form?.code ?? "",
+                status: m.form ? FORM_STATUS_TEXT[m.form.status] ?? m.form.status : "ยังไม่มีใบสอบ",
+                score: r ? r.score : null,
+                points: r && r.max != null ? `${r.earned} / ${r.max}` : null,
+                correct: r ? `${r.correct} / ${r.total}` : null,
+                passed: r && r.passed != null ? (r.passed ? "ผ่าน" : "ยังไม่ผ่าน") : null,
+                failed: r ? r.failed_subjects.join(", ") : null,
+                graded_at: r ? formatBangkok(r.graded_at) : null,
+                ...Object.fromEntries(topicCols.map((t) => [`t_${t.tpc_id}`, r?.topics[t.tpc_id] ?? null])),
+            });
+        }
+
+        const topicSheet = workbook.addWorksheet("สรุปรายหมวด");
+        topicSheet.columns = [
+            { header: "หมวด", key: "name", width: 32 },
+            { header: "ทำถูกเฉลี่ยทั้งกลุ่ม (%)", key: "accuracy", width: 22 },
+            { header: "จำนวนคนที่ตรวจแล้ว", key: "members", width: 20 },
+        ];
+        topicSheet.getRow(1).font = { bold: true };
+        for (const t of data.topics) topicSheet.addRow({ name: t.tpc_name, accuracy: t.accuracy, members: t.members });
+        topicSheet.addRow({});
+        topicSheet.addRow({ name: `${data.title} · ${data.prod_name} · รอบที่ ${data.round}` });
+        topicSheet.addRow({
+            name: `ตรวจแล้ว ${data.summary.graded} จาก ${data.summary.members} คน · คะแนนเฉลี่ย ${data.summary.average_score ?? "-"}%`,
+        });
+
+        const buffer = await workbook.xlsx.writeBuffer();
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        res.setHeader("Content-Disposition", `attachment; filename="fasttiw-group-${loaded.group.pg_id}-r${data.round}-results.xlsx"`);
+        res.setHeader("Cache-Control", "no-store");
+        res.send(Buffer.from(buffer));
+    } catch (err) {
+        next(err);
+    }
+}
+
 async function findByCode(code) {
     const [[row]] = await pool.query(
         `SELECT g.*, p.prod_name, o.cus_fname AS owner_fname, o.cus_lname AS owner_lname,
@@ -652,5 +921,7 @@ module.exports = {
     startNewRound,
     getGroupSheets,
     getGroupBooklet,
+    getGroupResults,
+    exportGroupResults,
     MAX_MEMBERS,
 };

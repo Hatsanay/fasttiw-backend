@@ -181,6 +181,8 @@ router.post("/V1/store/paper-groups/:id/forms", ...paperGroupGate, paperGroupCon
 router.post("/V1/store/paper-groups/:id/round", ...paperGroupGate, paperGroupController.startNewRound);
 router.get("/V1/store/paper-groups/:id/sheets", ...paperGroupGate, paperGroupController.getGroupSheets);
 router.get("/V1/store/paper-groups/:id/booklet", ...paperGroupGate, paperGroupController.getGroupBooklet);
+router.get("/V1/store/paper-groups/:id/results", ...paperGroupGate, paperGroupController.getGroupResults);
+router.get("/V1/store/paper-groups/:id/results.xlsx", ...paperGroupGate, paperGroupController.exportGroupResults);
 // สนามสอบเสมือนจริง — รายการที่ทำได้ + เริ่ม/ทำต่อ (ใบที่ได้ใช้ endpoint attempts ชุดเดิมทั้งหมดต่อจากนี้)
 router.get("/V1/store/mock-exams", requireCustomerAuth, mockExamController.listMockExams);
 router.post("/V1/store/mock-exams/:id/attempts", requireCustomerAuth, attemptController.startMockAttempt);
