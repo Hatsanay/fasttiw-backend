@@ -1,7 +1,7 @@
 const pool = require("../config/db");
 const { generateId } = require("../utils/generateId");
 const { findValidCoupon, incrementUsage } = require("./coupon.controller");
-const { grantOrRenewProduct, calculateDiscount, recordSale, linkEntitlementsToSale, snapshotExpiries } = require("./entitlement.controller");
+const { applyPurchase, heldProducts, calculateDiscount, recordSale, linkEntitlementsToSale } = require("./entitlement.controller");
 const { fetchSampleQuestions, buildQuestionPayload, SAMPLE_QUESTION_COUNT } = require("./attempt.controller");
 const stripeClient = require("../utils/stripeClient");
 const settingsController = require("./settings.controller");
@@ -249,6 +249,32 @@ async function checkout(req, res, next) {
             return res.status(400).json({ message: "มีชุดข้อสอบบางรายการไม่พร้อมขาย กรุณาลองใหม่" });
         }
 
+        // กติกาซื้อซ้ำ (ตกลงกับผู้ใช้ 2026-10-23 — ตัวตัดสินตอนให้สิทธิ์คือ applyPurchase ใน entitlement.controller.js)
+        //   ซื้อรายชุดที่ถือแบบถาวรอยู่แล้ว → ปฏิเสธ (เดิมจ่ายเงินได้ แล้วไม่ได้อะไรเพิ่ม — หน้าสินค้าซ่อนปุ่มไว้ แต่ตะกร้า/API ไม่กัน)
+        //   ซื้อรายชุดแบบมีวันหมดอายุที่ยังไม่หมด → ได้ (ต่อล่วงหน้า)
+        //   แพ็กเกจที่มีชุดที่ถืออยู่ → ต้องยืนยันก่อน (confirm_owned: true) · ชุดถาวร = โมฆะ ชุดมีวันหมดอายุ = ต่ออายุ
+        //   ราคาแพ็กเกจเต็มเสมอ — ลูกค้าเห็นรายชื่อชุดพวกนี้ก่อนตัดสินใจจ่าย
+        const held = await heldProducts(req.customer.cus_id, productIds);
+        const explicitIds = new Set(Array.isArray(product_ids) ? product_ids : []);
+        const ownedForever = products.filter((p) => explicitIds.has(p.prod_id) && held.get(p.prod_id) === "lifetime");
+        if (ownedForever.length) {
+            return res.status(409).json({
+                code: "ALREADY_OWNED",
+                message: `คุณมีชุดนี้แบบไม่มีวันหมดอายุอยู่แล้ว ซื้อซ้ำไม่ได้ — นำออกจากตะกร้าก่อน: ${ownedForever.map((p) => p.prod_name).join(", ")}`,
+                product_ids: ownedForever.map((p) => p.prod_id),
+            });
+        }
+        if (pkg && req.body?.confirm_owned !== true) {
+            const owned = products.filter((p) => !explicitIds.has(p.prod_id) && held.has(p.prod_id));
+            if (owned.length) {
+                return res.status(409).json({
+                    code: "PACKAGE_HAS_OWNED",
+                    message: "แพ็กเกจนี้มีชุดที่คุณมีอยู่แล้ว",
+                    owned: owned.map((p) => ({ prod_id: p.prod_id, prod_name: p.prod_name, kind: held.get(p.prod_id) })),
+                });
+            }
+        }
+
         // getEffectivePrice() เสมอ — product ที่ prod_is_free=TRUE ต้องนับเป็น 0 ไม่ว่า prod_price จะตั้งไว้
         // เท่าไหร่ (สูตรเดียวกับ recordSale() ต้องตรงกันเป๊ะ ไม่งั้นยอดที่ลูกค้าเห็นตอน checkout กับยอดขาย
         // ที่บันทึกจริงตอน settlePaidOrder จะไม่ตรงกัน)
@@ -373,7 +399,7 @@ async function settlePaidOrder(orderId) {
     }
 
     // join ดึง prod_entitlement_duration_months มาด้วย — ตั้งได้แยกรายชุดข้อสอบ (NULL = lifetime) เพื่อส่ง
-    // เป็น durationMonths ให้ grantOrRenewProduct() แทนค่า null ตายตัวแบบเดิม (เดิม grant ฝั่งลูกค้าซื้อเอง
+    // เป็น durationMonths ให้ applyPurchase() แทนค่า null ตายตัวแบบเดิม (เดิม grant ฝั่งลูกค้าซื้อเอง
     // เป็น lifetime เสมอไม่ว่า product ไหน) — ไม่กระทบสิทธิ์เดิมที่ลูกค้าถืออยู่แล้วก่อนหน้านี้เลย
     // ดึง prod_name/oi_total มาด้วยเพื่อใช้ในใบเสร็จที่ส่งอีเมลท้ายฟังก์ชัน (query เดิมอยู่แล้ว ไม่ได้ยิงเพิ่ม)
     const [items] = await pool.query(
@@ -391,17 +417,18 @@ async function settlePaidOrder(orderId) {
         coupon = couponRows[0] ?? null;
     }
 
-    // อ่านวันหมดอายุเดิมก่อนแตะสิทธิ์ — ใช้ถอยกลับตอนคืนเงินการต่ออายุ (ดู si_expires_before)
-    const expiresBefore = await snapshotExpiries(order.ord_customer_id, items.map((i) => i.oi_product_id));
-
+    // กติกาซื้อซ้ำอยู่ที่ applyPurchase ที่เดียว (ใหม่ / ต่อล่วงหน้า / เปิดใช้แถวที่หมดอายุ / โมฆะถ้าถือแบบถาวรอยู่)
+    // expiresBefore = วันหมดอายุเดิมของแถวที่ถูกแก้จริง ใช้ถอยกลับตอนคืนเงินการต่ออายุ (ดู si_expires_before)
+    // ชุดที่เป็นโมฆะไม่ผูกกับบิลนี้ — เดิมผูกสิทธิ์ถาวรใบเดิมเข้ากับบิลใหม่ คืนเงินบิลนี้ทีหลังจะยกเลิกสิทธิ์ที่ซื้อมาก่อนหน้าไปด้วย
     const entitlementIds = [];
     const entIdByProduct = new Map();
+    const expiresBefore = new Map();
     for (const item of items) {
-        const entId = await grantOrRenewProduct(order.ord_customer_id, item.oi_product_id, null, item.prod_entitlement_duration_months, "payment");
-        if (entId) {
-            entitlementIds.push(entId);
-            entIdByProduct.set(item.oi_product_id, entId);
-        }
+        const result = await applyPurchase(order.ord_customer_id, item.oi_product_id, null, item.prod_entitlement_duration_months, "payment");
+        entitlementIds.push(result.entId);
+        if (result.action === "void") continue;
+        entIdByProduct.set(item.oi_product_id, result.entId);
+        if (result.expiresBefore) expiresBefore.set(item.oi_product_id, result.expiresBefore);
     }
     if (coupon) await incrementUsage(coupon.cpn_id);
 
@@ -703,6 +730,29 @@ async function getOrder(req, res, next) {
     }
 }
 
+// สิทธิ์ของลูกค้า 1 คน → 1 แถวต่อ 1 ชุดข้อสอบ (2026-10-23 ผู้ใช้สั่ง)
+// tb_entitlements ตั้งใจให้ลูกค้าคนเดียวมีหลายแถวต่อชุดได้ (ดูคอมเมนต์ grantProduct) — เดิมส่งทุกแถวไปหน้าคลัง
+// ลูกค้าจึงเห็นชุดเดียวกันซ้ำหลายใบ ใบที่ "ใช้งานไม่ได้" (ถูกยกเลิก/หมดอายุ) ปนกับใบที่ใช้ได้
+// เลือกแถวที่ดีที่สุดของแต่ละชุด: ใช้งานได้ > หมดอายุ > ถูกยกเลิก · ใช้งานได้หลายแถว = ไม่มีวันหมดอายุก่อน แล้ววันหมดอายุไกลสุด
+// เรียงผล: ใช้งานได้ขึ้นก่อน แล้วหมดอายุ แล้วถูกยกเลิก · ในกลุ่มเดียวกันเรียงตามวันที่ได้สิทธิ์ล่าสุด
+const STATUS_RANK = { active: 0, expired: 1, revoked: 2 };
+function onePerProduct(rows) {
+    const better = (a, b) => {
+        if (STATUS_RANK[a.effective_status] !== STATUS_RANK[b.effective_status]) return STATUS_RANK[a.effective_status] < STATUS_RANK[b.effective_status];
+        if ((a.ent_expires_at === null) !== (b.ent_expires_at === null)) return a.ent_expires_at === null;
+        if (a.ent_expires_at && b.ent_expires_at) return new Date(a.ent_expires_at) > new Date(b.ent_expires_at);
+        return new Date(a.ent_granted_at) > new Date(b.ent_granted_at);
+    };
+    const best = new Map();
+    for (const row of rows) {
+        const current = best.get(row.ent_product_id);
+        if (!current || better(row, current)) best.set(row.ent_product_id, row);
+    }
+    return [...best.values()].sort(
+        (a, b) => STATUS_RANK[a.effective_status] - STATUS_RANK[b.effective_status] || new Date(b.ent_granted_at) - new Date(a.ent_granted_at)
+    );
+}
+
 async function getMyEntitlements(req, res, next) {
     try {
         const [rows] = await pool.query(
@@ -718,7 +768,7 @@ async function getMyEntitlements(req, res, next) {
              ORDER BY e.ent_granted_at DESC`,
             [req.customer.cus_id]
         );
-        res.json({ data: rows });
+        res.json({ data: onePerProduct(rows) });
     } catch (err) {
         next(err);
     }

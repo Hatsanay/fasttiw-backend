@@ -24,39 +24,70 @@ async function grantProduct(customerId, productId, grantedById, durationMonths, 
     return ent_id;
 }
 
-// ใช้เฉพาะฝั่งลูกค้าเช็คเอาท์เอง (ไม่ใช่แอดมิน grant มือ) — ถ้าลูกค้ายังถือสิทธิ์ product นี้อยู่จริง
-// (active ไม่หมดอายุ) ให้ "ต่ออายุ" จากวันหมดอายุเดิมแทนสร้างแถวใหม่ซ้ำ กันรู้สึกเสียเงินฟรีตอนซื้อซ้ำ/
-// ซื้อผ่าน package ที่มี product ที่ถืออยู่แล้ว (ตามที่ตกลงไว้ในแผนงาน) — ไม่แตะ lifetime (expires_at
-// เป็น NULL) เด็ดขาดไม่ว่าทางใด เพราะเป็นสิทธิ์ที่ดีที่สุดอยู่แล้ว ไม่มีทางทำให้ดีขึ้นกว่านี้
-async function grantOrRenewProduct(customerId, productId, grantedById, durationMonths, grantedVia = "payment") {
-    const hasAccess = await hasActiveEntitlement(customerId, productId);
-    if (!hasAccess) {
-        return grantProduct(customerId, productId, grantedById, durationMonths, grantedVia);
-    }
-
+// ─── กติกาการซื้อซ้ำ (ตกลงกับผู้ใช้ 2026-10-23) ───────────────────────────────────────────────────
+// จุดเดียวที่ตัดสินว่าการซื้อ/ให้สิทธิ์ครั้งนี้ทำอะไรกับสิทธิ์เดิม — ใช้ทั้งลูกค้าซื้อเอง (settlePaidOrder) และแอดมิน (createBatch)
+//   ถือแบบถาวรอยู่          → "void"        ไม่เปลี่ยนอะไร · ซื้อรายชุดถูกกันไว้ก่อนถึงตรงนี้แล้ว (heldProducts)
+//                                            ผ่านแพ็กเกจ = ชุดนั้นเป็นโมฆะ คิดราคาแพ็กเกจเต็ม (ลูกค้าถูกเตือนก่อนจ่าย)
+//   ถือแบบมีวันหมดอายุ (ยังไม่หมด) → "renewed"  ต่อล่วงหน้าจากวันหมดอายุเดิม · ของใหม่เป็นแบบถาวร = อัปเกรดเป็นถาวร
+//   เคยมีแต่หมดอายุแล้ว       → "reactivated" เปิดใช้แถวเดิมอีกครั้ง นับอายุใหม่จากวันนี้
+//                                            ไม่สร้างแถวใหม่ — แถวซ้ำทำให้คลังข้อสอบมีการ์ดชุดเดียวกันหลายใบ
+//   ไม่เคยมี / มีแต่ถูกยกเลิก   → "new"         สร้างแถวใหม่ (สิทธิ์ที่แอดมินยกเลิกไม่ถูกปลุกกลับมาเอง)
+// คืน expiresBefore = วันหมดอายุก่อนรอบนี้ของแถวที่ถูกแก้ ใช้เขียน si_expires_before ไว้ถอยกลับตอนคืนเงิน (ข้อ 5.2)
+async function applyPurchase(customerId, productId, grantedById, durationMonths, grantedVia = "payment") {
     const [rows] = await pool.query(
-        `SELECT ent_id, ent_expires_at FROM tb_entitlements
-         WHERE ent_customer_id = ? AND ent_product_id = ? AND ent_status = 'active'
-           AND (ent_expires_at IS NULL OR ent_expires_at > NOW())
-         ORDER BY ent_expires_at IS NULL DESC, ent_expires_at DESC LIMIT 1`,
+        `SELECT ent_id, ent_expires_at,
+                (ent_status = 'active' AND (ent_expires_at IS NULL OR ent_expires_at > NOW())) AS live
+         FROM tb_entitlements
+         WHERE ent_customer_id = ? AND ent_product_id = ? AND ent_status <> 'revoked'
+         ORDER BY live DESC, ent_expires_at IS NULL DESC, ent_expires_at DESC`,
         [customerId, productId]
     );
     const existing = rows[0];
 
-    if (existing.ent_expires_at === null) {
-        return existing.ent_id; // lifetime อยู่แล้ว ไม่มีอะไรต้องทำ
+    if (!existing) {
+        const entId = await grantProduct(customerId, productId, grantedById, durationMonths, grantedVia);
+        return { entId, action: "new", expiresBefore: null };
     }
-    if (!durationMonths) {
-        // ของใหม่ให้ lifetime แต่ของเดิมมีวันหมดอายุ → อัปเกรดเป็น lifetime
-        await pool.query("UPDATE tb_entitlements SET ent_expires_at = NULL WHERE ent_id = ?", [existing.ent_id]);
-        return existing.ent_id;
+    if (existing.live && existing.ent_expires_at === null) {
+        return { entId: existing.ent_id, action: "void", expiresBefore: null };
     }
-
+    if (existing.live) {
+        await pool.query(
+            durationMonths
+                ? "UPDATE tb_entitlements SET ent_expires_at = DATE_ADD(ent_expires_at, INTERVAL ? MONTH) WHERE ent_id = ?"
+                : "UPDATE tb_entitlements SET ent_expires_at = NULL WHERE ent_id = ?",
+            durationMonths ? [durationMonths, existing.ent_id] : [existing.ent_id]
+        );
+        return { entId: existing.ent_id, action: "renewed", expiresBefore: existing.ent_expires_at };
+    }
+    // หมดอายุแล้ว (job รายชั่วโมงอาจเปลี่ยนสถานะเป็น 'expired' ไปแล้ว หรือยังเป็น 'active' ที่เลยวัน) — เปิดใช้แถวเดิม
     await pool.query(
-        "UPDATE tb_entitlements SET ent_expires_at = DATE_ADD(ent_expires_at, INTERVAL ? MONTH) WHERE ent_id = ?",
-        [durationMonths, existing.ent_id]
+        `UPDATE tb_entitlements SET ent_status = 'active',
+                ent_expires_at = ${durationMonths ? "DATE_ADD(NOW(), INTERVAL ? MONTH)" : "NULL"}
+         WHERE ent_id = ?`,
+        durationMonths ? [durationMonths, existing.ent_id] : [existing.ent_id]
     );
-    return existing.ent_id;
+    return { entId: existing.ent_id, action: "reactivated", expiresBefore: existing.ent_expires_at };
+}
+
+// คงไว้ให้ผู้เรียกเดิมที่ต้องการแค่ ent_id
+async function grantOrRenewProduct(customerId, productId, grantedById, durationMonths, grantedVia = "payment") {
+    return (await applyPurchase(customerId, productId, grantedById, durationMonths, grantedVia)).entId;
+}
+
+// ชุดที่ลูกค้าถือสิทธิ์ใช้งานได้อยู่ตอนนี้ → Map<productId, "lifetime" | "timed">
+// ใช้กันซื้อรายชุดที่ถือแบบถาวรซ้ำ + เตือนตอนซื้อแพ็กเกจที่มีชุดที่ถืออยู่แล้ว
+async function heldProducts(customerId, productIds, db = pool) {
+    if (!productIds.length) return new Map();
+    const [rows] = await db.query(
+        `SELECT ent_product_id, MAX(ent_expires_at IS NULL) AS lifetime
+         FROM tb_entitlements
+         WHERE ent_customer_id = ? AND ent_product_id IN (?) AND ent_status = 'active'
+           AND (ent_expires_at IS NULL OR ent_expires_at > NOW())
+         GROUP BY ent_product_id`,
+        [customerId, productIds]
+    );
+    return new Map(rows.map((r) => [r.ent_product_id, Number(r.lifetime) ? "lifetime" : "timed"]));
 }
 
 // เช็คว่า customer ถือสิทธิ์ product นี้อยู่จริงหรือไม่ ณ ตอนนี้ — ใช้ predicate เดียวกับที่ schema
@@ -153,19 +184,6 @@ async function recordSale(customerId, productIds, coupon, createdById, gatewayFe
     return sale_id;
 }
 
-// อ่านวันหมดอายุของสิทธิ์ "ก่อน" จะ grant/ต่ออายุ — ต้องเรียกก่อนแตะ tb_entitlements เสมอ
-// ค่านี้ถูกเก็บลง si_expires_before เพื่อให้ระบบคืนเงินในอนาคตถอยวันหมดอายุกลับจุดเดิมได้
-// (ตัดสินใจร่วมกับผู้ใช้ 2026-09-06 ว่าคืนเงินการต่ออายุต้องถอยกลับ ไม่ใช่ยกเลิกสิทธิ์ทั้งใบ)
-// productId ที่ยังไม่เคยมีสิทธิ์เลยจะไม่มีคีย์ใน Map = ซื้อครั้งแรก คืนเงินแล้วยกเลิกทั้งใบได้เลย
-async function snapshotExpiries(customerId, productIds) {
-    if (productIds.length === 0) return new Map();
-    const [rows] = await pool.query(
-        "SELECT ent_product_id, ent_expires_at FROM tb_entitlements WHERE ent_customer_id = ? AND ent_product_id IN (?)",
-        [customerId, productIds]
-    );
-    return new Map(rows.map((r) => [r.ent_product_id, r.ent_expires_at]));
-}
-
 // ผูกสิทธิ์ที่เพิ่ง grant/ต่ออายุ เข้ากับรายการขายรายชิ้นของบิลที่เพิ่งบันทึก
 //
 // **ต้องรับ ent_id มาตรงๆ ห้ามจับคู่ด้วย (ลูกค้า + ชุดข้อสอบ)** — tb_entitlements ไม่มี unique ที่
@@ -245,6 +263,19 @@ async function createBatch(req, res, next) {
             return res.status(400).json({ message: "กรุณาเลือกชุดข้อสอบอย่างน้อย 1 ชุด" });
         }
 
+        // กติกาซื้อซ้ำเดียวกับฝั่งลูกค้า (applyPurchase) — เลือกรายชุดที่ลูกค้าถือแบบถาวรอยู่แล้วไม่ได้
+        // เช็คก่อน claim คูปอง/ให้สิทธิ์ใดๆ · ผ่านแพ็กเกจได้ (ชุดนั้นเป็นโมฆะ ไม่เปลี่ยนอะไร — บอกในข้อความผลลัพธ์)
+        const explicitIds = Array.isArray(product_ids) ? product_ids : [];
+        const held = await heldProducts(req.params.id, productIds);
+        const blocked = explicitIds.filter((id) => held.get(id) === "lifetime");
+        if (blocked.length) {
+            const [names] = await pool.query("SELECT prod_name FROM tb_products WHERE prod_id IN (?)", [blocked]);
+            return res.status(409).json({
+                message: `ลูกค้ามีชุดนี้แบบไม่มีวันหมดอายุอยู่แล้ว ให้ซ้ำไม่ได้: ${names.map((n) => n.prod_name).join(", ")}`,
+                product_ids: blocked,
+            });
+        }
+
         // claim โควตาคูปองตรงนี้เลย (ก่อน grant สิทธิ์ใดๆ ทั้งสิ้น) ไม่ใช่ทีหลังสุดก่อน recordSale แบบเดิม —
         // เดิม incrementUsage() คืนค่า false ได้ (ชนโควตาพอดีจากคำขอคู่แข่งที่ claim ไปก่อนเสี้ยววินาที) แต่
         // โค้ดทิ้งค่านั้นไปเฉยๆ แล้วยัง recordSale() ด้วยส่วนลดของคูปองเหมือนเดิม กลายเป็นบันทึกรายได้ต่ำกว่า
@@ -278,11 +309,20 @@ async function createBatch(req, res, next) {
             return res.status(400).json({ message: "มีชุดข้อสอบบางรายการไม่พบในระบบ" });
         }
 
-        const expiresBefore = await snapshotExpiries(req.params.id, productIds);
-
+        // เดิมเรียก grantProduct (สร้างแถวใหม่ทุกครั้ง) — แอดมินให้สิทธิ์ชุดที่ลูกค้ามีอยู่แล้วจึงได้แถวซ้ำ
+        // (ต้นเหตุการ์ดซ้ำในคลังข้อสอบที่ผู้ใช้เจอ 2026-10-23) · ตอนนี้ใช้กติกาเดียวกับลูกค้าซื้อเอง
+        // ชุดที่เป็นโมฆะไม่ผูกกับรายการขายนี้ — คืนเงินบิลนี้ทีหลังต้องไม่ไปแตะสิทธิ์ถาวรที่ได้มาจากบิลเดิม
         const entIdByProduct = new Map();
+        const expiresBefore = new Map();
+        let voided = 0;
         for (const productId of productIds) {
-            entIdByProduct.set(productId, await grantProduct(req.params.id, productId, req.user.user_id, durationMonths));
+            const result = await applyPurchase(req.params.id, productId, req.user.user_id, durationMonths, "manual");
+            if (result.action === "void") {
+                voided++;
+                continue;
+            }
+            entIdByProduct.set(productId, result.entId);
+            if (result.expiresBefore) expiresBefore.set(productId, result.expiresBefore);
         }
 
         // ส่วนลดของแพ็กเกจไม่ได้ผูกกับคูปอง ต้องคำนวณเป็น (ราคารวมถ้าซื้อแยก - ราคาแพ็กเกจ) แล้วส่งเป็น
@@ -306,9 +346,14 @@ async function createBatch(req, res, next) {
         }
 
         const what = pkg ? "ให้สิทธิ์จากแพ็กเกจสำเร็จ" : "ให้สิทธิ์สำเร็จ";
+        const granted = productIds.length - voided;
         res.status(201).json({
-            message: `${what} ${productIds.length} ชุด${shouldCharge ? "" : " (ไม่คิดเงิน ไม่บันทึกยอดขาย)"}`,
-            granted: productIds.length,
+            message:
+                `${what} ${granted} ชุด` +
+                (voided ? ` · ข้าม ${voided} ชุดที่ลูกค้ามีแบบไม่มีวันหมดอายุอยู่แล้ว` : "") +
+                (shouldCharge ? "" : " (ไม่คิดเงิน ไม่บันทึกยอดขาย)"),
+            granted,
+            skipped_owned: voided,
             charged: shouldCharge,
         });
     } catch (err) {
@@ -601,6 +646,6 @@ async function updateExpiry(req, res, next) {
 
 module.exports = {
     grantProduct, grantOrRenewProduct, createBatch, getByCustomer, getAll, revoke, restore, updateExpiry,
-    linkEntitlementsToSale, snapshotExpiries, REVOKE_REASONS,
+    linkEntitlementsToSale, applyPurchase, heldProducts, REVOKE_REASONS,
     hasActiveEntitlement, calculateDiscount, recordSale,
 };
